@@ -67,7 +67,10 @@ passport.serializeUser((u,d) => d(null,u));
 passport.deserializeUser((u,d) => d(null,u));
 
 // ── Auth ───────────────────────────────────────────────────────────
-app.get('/auth/discord', passport.authenticate('discord'));
+app.get('/auth/discord', (req, res, next) => {
+  if (req.query.returnTo) req.session.returnTo = req.query.returnTo;
+  passport.authenticate('discord')(req, res, next);
+});
 app.get('/auth/discord/callback',
   passport.authenticate('discord', { failureRedirect: `${FRONTEND_URL}/?error=auth` }),
   (req, res) => {
@@ -76,7 +79,10 @@ app.get('/auth/discord/callback',
       displayName: req.user.displayName, avatar: req.user.avatar,
       isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||VIP_HOSTS.includes(nameOf(req.user))
     })).toString('base64');
-    res.redirect(`${FRONTEND_URL}/hunt?auth=${encodeURIComponent(userData)}`);
+    const returnTo = req.session?.returnTo || '/hunt';
+    delete req.session?.returnTo;
+    const safePath = returnTo.startsWith('/') ? returnTo : '/hunt';
+    res.redirect(`${FRONTEND_URL}${safePath}?auth=${encodeURIComponent(userData)}`);
   }
 );
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect(FRONTEND_URL)));
