@@ -35,7 +35,16 @@ function isEquityMember(user, huntOwnerId) {
   const hunt = hunts[huntOwnerId];
   if (!hunt) return false;
   const name = nameOf(user);
-  return hunt.equity.some(e => e.name && e.name.toLowerCase().trim() === name);
+  // Match on Discord ID first (most reliable), then name fuzzy match
+  const userId = user?.id;
+  const nameNoSpaces = name.replace(/\s+/g,'');
+  return hunt.equity.some(e => {
+    if (!e.name && !e.discordId) return false;
+    if (userId && e.discordId && e.discordId === userId) return true;
+    const en = (e.name||'').toLowerCase().trim();
+    const enNoSpaces = en.replace(/\s+/g,'');
+    return en === name || enNoSpaces === nameNoSpaces || en === nameNoSpaces || enNoSpaces === name;
+  });
 }
 
 // ── Middleware ─────────────────────────────────────────────────────
@@ -124,6 +133,25 @@ app.get('/api/hunts/:userId', (req, res) => {
   if (!hunt.isLive && !hunt.archivedAt && !(req.user && canEditHunt(req.user, req.params.userId)))
     return res.status(404).json({error:'Hunt not live'});
   const canEdit  = req.user ? canEditHunt(req.user, req.params.userId) : false;
+
+  // Auto-link: when a logged-in viewer visits, match their Discord name to an equity entry and store their ID
+  if (req.user?.id && hunt.equity) {
+    const vName = nameOf(req.user);
+    const vNoSp = vName.replace(/\s+/g,'');
+    let linked = false;
+    hunt.equity = hunt.equity.map(e => {
+      if (e.discordId) return e;
+      const en = (e.name||'').toLowerCase().trim();
+      const enNoSp = en.replace(/\s+/g,'');
+      if (en===vName||enNoSp===vNoSp||en===vNoSp||enNoSp===vName) {
+        linked = true;
+        return { ...e, discordId: req.user.id, name: req.user.displayName || e.name };
+      }
+      return e;
+    });
+    if (linked) emitHuntUpdate(req.params.userId);
+  }
+
   const canCalls = req.user ? (canEdit || isEquityMember(req.user, req.params.userId)) : false;
   res.json({ ...hunt, canEdit, canAddCalls: canCalls });
 });
