@@ -336,6 +336,12 @@ app.post('/api/admin/fetch-and-import-mitch-hunts', async (req, res) => {
         
         console.log(`Page ${page}: Got ${hunts.length} hunts`);
         
+        // Log first hunt structure to see field names
+        if (page === 0 && hunts.length > 0) {
+          console.log(`Sample hunt object keys:`, Object.keys(hunts[0]));
+          console.log(`Sample hunt data:`, JSON.stringify(hunts[0]).substring(0, 300));
+        }
+        
         // Transform mitchjones format to our format
         const transformed = hunts.map(h => ({
           slot: h.game?.name || h.slot?.name || h.slot || h.game || 'Unknown',
@@ -344,12 +350,17 @@ app.post('/api/admin/fetch-and-import-mitch-hunts', async (req, res) => {
           multiplier: parseFloat(h.multiplier) || 0,
           provider: h.provider || h.game?.provider || '',
           date: h.date || new Date().toISOString()
-        })).filter(t => t.bet > 0 || t.win > 0);
+        }));
         
-        if (transformed.length > 0) {
+        console.log(`Page ${page}: Transformed ${transformed.length}, first bet=${transformed[0]?.bet} win=${transformed[0]?.win}`);
+        
+        const filtered = transformed.filter(t => t.bet > 0 || t.win > 0);
+        console.log(`Page ${page}: After filter: ${filtered.length} hunts`);
+        
+        if (filtered.length > 0) {
           allHunts.push({
             date: new Date().toISOString(),
-            bonuses: transformed
+            bonuses: filtered
           });
         }
       } catch (pageErr) {
