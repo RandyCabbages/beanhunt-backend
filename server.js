@@ -310,27 +310,46 @@ app.post('/api/admin/fetch-and-import-mitch-hunts', async (req, res) => {
     
     // Fetch all pages from mitchjones API
     for (let page = 0; page < 20; page++) {
-      const response = await fetch(`https://mitchjones.vip/api/bonus-hunt/list?page=${page}`);
-      if (!response.ok) break;
-      
-      const data = await response.json();
-      if (!data.hunts || data.hunts.length === 0) break;
-      
-      // Transform mitchjones format to our format
-      const transformed = data.hunts.map(h => ({
-        slot: h.game?.name || h.slot?.name || h.slot || h.game || 'Unknown',
-        bet: parseFloat(h.bet) || 0,
-        win: parseFloat(h.payout || h.win || 0) || 0,
-        multiplier: parseFloat(h.multiplier) || 0,
-        provider: h.provider || h.game?.provider || '',
-        date: h.date || new Date().toISOString()
-      }));
-      
-      allHunts.push({
-        date: new Date().toISOString(),
-        bonuses: transformed
-      });
+      try {
+        const response = await fetch(`https://mitchjones.vip/api/bonus-hunt/list?page=${page}`, {
+          timeout: 10000
+        });
+        if (!response.ok) {
+          console.log(`Page ${page}: Status ${response.status}, breaking`);
+          break;
+        }
+        
+        const data = await response.json();
+        if (!data.hunts || data.hunts.length === 0) {
+          console.log(`Page ${page}: No hunts, breaking`);
+          break;
+        }
+        
+        console.log(`Page ${page}: Got ${data.hunts.length} hunts`);
+        
+        // Transform mitchjones format to our format
+        const transformed = data.hunts.map(h => ({
+          slot: h.game?.name || h.slot?.name || h.slot || h.game || 'Unknown',
+          bet: parseFloat(h.bet) || 0,
+          win: parseFloat(h.payout || h.win || 0) || 0,
+          multiplier: parseFloat(h.multiplier) || 0,
+          provider: h.provider || h.game?.provider || '',
+          date: h.date || new Date().toISOString()
+        })).filter(t => t.bet > 0 || t.win > 0); // Only include if there's actual data
+        
+        if (transformed.length > 0) {
+          allHunts.push({
+            date: new Date().toISOString(),
+            bonuses: transformed
+          });
+        }
+      } catch (pageErr) {
+        console.error(`Error fetching page ${page}:`, pageErr.message);
+        break;
+      }
     }
+    
+    console.log(`Total hunts fetched: ${allHunts.length}`);
     
     // Now import using the existing import logic
     mitchHunts = allHunts;
