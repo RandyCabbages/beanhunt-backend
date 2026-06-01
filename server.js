@@ -516,11 +516,13 @@ let validatedGames = []; // only games confirmed to have a working thumbnail
 let thumbValidationDone = false;
 const ONE_DAY = 24 * 60 * 60 * 1000;
 
+const SLOTS_CACHE_VERSION = 2; // bump to force re-validation
+
 function loadSlotsCache() {
   try {
     if (fs.existsSync(SLOTS_FILE)) {
       const data = JSON.parse(fs.readFileSync(SLOTS_FILE, 'utf8'));
-      if (data.validatedAt && Date.now() - data.validatedAt < ONE_DAY && Array.isArray(data.games) && data.games.length > 0) {
+      if (data.version === SLOTS_CACHE_VERSION && data.validatedAt && Date.now() - data.validatedAt < ONE_DAY && Array.isArray(data.games) && data.games.length > 0) {
         validatedGames = data.games;
         thumbValidationDone = true;
         console.log(`[slots] Loaded ${validatedGames.length} validated slots from cache (${Math.round((Date.now()-data.validatedAt)/3600000)}h old)`);
@@ -533,7 +535,7 @@ function loadSlotsCache() {
 
 function saveSlotsCache() {
   try {
-    fs.writeFileSync(SLOTS_FILE, JSON.stringify({ validatedAt: Date.now(), games: validatedGames }, null, 2));
+    fs.writeFileSync(SLOTS_FILE, JSON.stringify({ version: SLOTS_CACHE_VERSION, validatedAt: Date.now(), games: validatedGames }, null, 2));
     console.log(`[slots] Saved ${validatedGames.length} slots to cache`);
   } catch(e) { console.error('[slots] Failed to save slots cache:', e.message); }
 }
@@ -547,6 +549,14 @@ async function getSlotGames() {
     const res = await fetch('https://slot.report/api/v1/slots.json');
     const data = await res.json();
     slotCache.games = (data.results || []).filter(s => s.name);
+    // Deduplicate by name (keep first occurrence)
+    const seen = new Set();
+    slotCache.games = slotCache.games.filter(g => {
+      const key = g.name.toLowerCase().trim();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
     slotCache.fetchedAt = Date.now();
     console.log(`[slots] Fetched ${slotCache.games.length} slots from slot.report`);
   } catch(e) {
