@@ -21,7 +21,8 @@ const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,m
 const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage').toLowerCase().split(',').map(s=>s.trim());
 
 function nameOf(user) { return (user?.displayName || user?.username || '').toLowerCase().trim(); }
-function isAdmin(user) { return user ? ADMINS.includes(nameOf(user)) : false; }
+const ADMIN_IDS = (process.env.ADMIN_IDS || '135203806676779008').split(',').map(s=>s.trim()).filter(Boolean);
+function isAdmin(user) { return user ? (ADMINS.includes(nameOf(user)) || ADMIN_IDS.includes(String(user.id))) : false; }
 function canEditHunt(user, huntOwnerId) {
   if (!user) return false;
   if (isAdmin(user)) return true;
