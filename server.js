@@ -5,8 +5,6 @@ const DiscordStrategy = require('passport-discord').Strategy;
 const cors            = require('cors');
 const http            = require('http');
 const { Server }      = require('socket.io');
-const fs              = require('fs');
-const path            = require('path');
 
 const app    = express();
 const server = http.createServer(app);
@@ -21,8 +19,7 @@ const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,m
 const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage').toLowerCase().split(',').map(s=>s.trim());
 
 function nameOf(user) { return (user?.displayName || user?.username || '').toLowerCase().trim(); }
-const ADMIN_IDS = (process.env.ADMIN_IDS || '135203806676779008').split(',').map(s=>s.trim()).filter(Boolean);
-function isAdmin(user) { return user ? (ADMINS.includes(nameOf(user)) || ADMIN_IDS.includes(String(user.id))) : false; }
+function isAdmin(user) { return user ? ADMINS.includes(nameOf(user)) : false; }
 function canEditHunt(user, huntOwnerId) {
   if (!user) return false;
   if (isAdmin(user)) return true;
@@ -106,24 +103,7 @@ app.get('/auth/me', (req, res) => {
 });
 
 // ── State ──────────────────────────────────────────────────────────
-const HUNTS_FILE = path.join(__dirname, 'hunts_data.json');
-
-function loadHunts() {
-  try {
-    if (fs.existsSync(HUNTS_FILE)) {
-      const raw = fs.readFileSync(HUNTS_FILE, 'utf8');
-      return JSON.parse(raw);
-    }
-  } catch(e) { console.error('Failed to load hunts:', e); }
-  return {};
-}
-
-function saveHunts() {
-  try { fs.writeFileSync(HUNTS_FILE, JSON.stringify(hunts, null, 2)); }
-  catch(e) { console.error('Failed to save hunts:', e); }
-}
-
-const hunts   = loadHunts();
+const hunts   = {};
 const viewers = {};
 let beanLive  = { isLive: false, title: '', updatedAt: null };
 
@@ -142,6 +122,7 @@ function huntSummary(h) {
 function getPublicHunts()  { return Object.values(hunts).filter(h=>h.isLive).map(huntSummary); }
 function getAllHunts()      { return Object.values(hunts).map(huntSummary); }
 function emitHubUpdate()   { io.emit('hub:update', getPublicHunts()); }
+function emitHuntUpdate(userId) { const h = hunts[userId]; if (h) io.to(`hunt:${userId}`).emit('hunt:update', h); }
 
 function requireAuth(req, res, next)  { if (!req.user) return res.status(401).json({error:'Not authenticated'}); next(); }
 function requireAdmin(req, res, next) { if (!req.user||!isAdmin(req.user)) return res.status(403).json({error:'Admin only'}); next(); }
@@ -189,7 +170,6 @@ app.post('/api/my-hunt/start', requireAuth, (req, res) => {
     user: req.user, isLive: false, startedAt: null, archivedAt: null,
     huntType, bonuses: [], equity: huntType==='vip'?[{id:'bean_auto',name:'Bean',amount:1000,isRollWinner:false}]:[], calls: [], invitedEditors: [], callLimit: 0, huntMode: 'creating'
   };
-  saveHunts();
   res.json({ok:true});
 });
 
@@ -198,7 +178,6 @@ app.post('/api/my-hunt/golive', requireAuth, (req, res) => {
   hunts[req.user.id].isLive    = true;
   hunts[req.user.id].startedAt = new Date().toISOString();
   hunts[req.user.id].archivedAt= null;
-  saveHunts();
   emitHubUpdate();
   io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
   res.json({ok:true});
@@ -208,7 +187,6 @@ app.post('/api/my-hunt/end', requireAuth, (req, res) => {
   if (hunts[req.user.id]) {
     hunts[req.user.id].isLive    = false;
     hunts[req.user.id].archivedAt= new Date().toISOString();
-    saveHunts();
     emitHubUpdate();
     io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
   }
@@ -218,7 +196,6 @@ app.post('/api/my-hunt/end', requireAuth, (req, res) => {
 app.post('/api/my-hunt/reset', requireAuth, (req, res) => {
   hunts[req.user.id] = { user: req.user, isLive: false, startedAt: null, archivedAt: null,
     huntType: 'community', bonuses: [], equity: [], calls: [], invitedEditors: [], callLimit: 0, huntMode: 'creating' };
-  saveHunts();
   emitHubUpdate();
   res.json({ok:true});
 });
@@ -239,7 +216,6 @@ app.put('/api/my-hunt', requireAuth, (req, res) => {
   }
   if (callLimit !== undefined) hunts[req.user.id].callLimit = callLimit;
   if (huntMode  !== undefined) hunts[req.user.id].huntMode  = huntMode;
-  saveHunts();
   io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
   emitHubUpdate();
   res.json({ok:true});
@@ -254,7 +230,6 @@ app.post('/api/my-hunt/invite', requireAuth, (req, res) => {
   if (!hunts[req.user.id].invitedEditors) hunts[req.user.id].invitedEditors = [];
   if (!hunts[req.user.id].invitedEditors.includes(lower))
     hunts[req.user.id].invitedEditors.push(lower);
-  saveHunts();
   // Tell everyone watching this hunt to re-fetch their permissions
   io.to(`hunt:${req.user.id}`).emit('hunt:reinvite', { huntUserId: req.user.id });
   res.json({ok:true, invitedEditors: hunts[req.user.id].invitedEditors});
@@ -265,7 +240,6 @@ app.delete('/api/my-hunt/invite', requireAuth, (req, res) => {
   if (!hunts[req.user.id]) return res.status(404).json({error:'No hunt'});
   hunts[req.user.id].invitedEditors = (hunts[req.user.id].invitedEditors||[])
     .filter(u => u !== username.toLowerCase().trim());
-  saveHunts();
   io.to(`hunt:${req.user.id}`).emit('hunt:reinvite', { huntUserId: req.user.id });
   res.json({ok:true, invitedEditors: hunts[req.user.id].invitedEditors});
 });
@@ -312,13 +286,14 @@ app.put('/api/hunts/:userId', requireAuth, (req, res) => {
   if (!canEditHunt(req.user, req.params.userId)) return res.status(403).json({error:'Not authorised'});
   const hunt = hunts[req.params.userId];
   if (!hunt) return res.status(404).json({error:'Hunt not found'});
-  const { bonuses, equity, calls, huntType, callLimit, huntMode } = req.body;
-  if (bonuses   !== undefined) hunt.bonuses   = bonuses;
-  if (equity    !== undefined) hunt.equity    = equity;
-  if (calls     !== undefined) hunt.calls     = calls;
-  if (huntType  !== undefined) hunt.huntType  = huntType;
-  if (callLimit !== undefined) hunt.callLimit = callLimit;
-  if (huntMode  !== undefined) hunt.huntMode  = huntMode;
+  const { bonuses, equity, calls, huntType, callLimit, huntMode, roundRobin } = req.body;
+  if (bonuses     !== undefined) hunt.bonuses     = bonuses;
+  if (equity      !== undefined) hunt.equity      = equity;
+  if (calls       !== undefined) hunt.calls       = calls;
+  if (huntType    !== undefined) hunt.huntType    = huntType;
+  if (callLimit   !== undefined) hunt.callLimit   = callLimit;
+  if (huntMode    !== undefined) hunt.huntMode    = huntMode;
+  if (roundRobin  !== undefined) hunt.roundRobin  = roundRobin;
   io.to(`hunt:${req.params.userId}`).emit('hunt:update', hunt);
   emitHubUpdate();
   res.json({ok:true});
@@ -510,149 +485,8 @@ app.get('/api/discord/parse-winners', requireAuth, async (req, res) => {
 });
 
 
-// ── Rainbet Game Scraper ──────────────────────────────────────────
-const RAINBET_FILE = path.join(__dirname, 'rainbet_games.json');
-let rainbetGames = []; // scraped from Rainbet via headless Chrome
-
-function loadRainbetCache() {
-  try {
-    if (fs.existsSync(RAINBET_FILE)) {
-      const data = JSON.parse(fs.readFileSync(RAINBET_FILE, 'utf8'));
-      if (data.savedAt && Date.now() - data.savedAt < 24 * 60 * 60 * 1000 && Array.isArray(data.games) && data.games.length > 0) {
-        rainbetGames = data.games;
-        console.log(`[rainbet] Loaded ${rainbetGames.length} games from cache`);
-        return true;
-      }
-    }
-  } catch(e) { console.error('[rainbet] Failed to load cache:', e.message); }
-  return false;
-}
-
-function saveRainbetCache() {
-  try {
-    fs.writeFileSync(RAINBET_FILE, JSON.stringify({ savedAt: Date.now(), games: rainbetGames }, null, 2));
-    console.log(`[rainbet] Saved ${rainbetGames.length} games to cache`);
-  } catch(e) { console.error('[rainbet] Failed to save cache:', e.message); }
-}
-
-async function scrapeRainbetGames() {
-  console.log('[rainbet] Launching headless Chrome to scrape game list...');
-  let puppeteer, browser;
-  try {
-    puppeteer = require('puppeteer-extra');
-    const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-    puppeteer.use(StealthPlugin());
-
-    const launchOpts = {
-      headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-    };
-    // On Railway, use system Chromium installed via nixpacks
-    if (process.env.CHROMIUM_PATH) launchOpts.executablePath = process.env.CHROMIUM_PATH;
-
-    browser = await puppeteer.launch(launchOpts);
-    const page = await browser.newPage();
-
-    // Intercept all JSON responses and look for the game list
-    const candidates = [];
-    page.on('response', async (res) => {
-      try {
-        const ct = res.headers()['content-type'] || '';
-        if (!ct.includes('json')) return;
-        const json = await res.json();
-        // Accept any response that looks like a list of games
-        const arr = Array.isArray(json) ? json
-          : (json.games || json.data || json.results || json.items || json.list);
-        if (Array.isArray(arr) && arr.length > 10) {
-          const sample = arr[0];
-          if (sample && (sample.name || sample.title || sample.game_name)) {
-            candidates.push({ url: res.url(), games: arr });
-            console.log(`[rainbet] Intercepted candidate: ${res.url()} (${arr.length} items)`);
-          }
-        }
-      } catch {}
-    });
-
-    await page.goto('https://rainbet.com/casino/slots', { waitUntil: 'networkidle2', timeout: 60000 });
-    // Extra wait for lazy-loaded/paginated content
-    await new Promise(r => setTimeout(r, 4000));
-
-    if (candidates.length === 0) {
-      console.warn('[rainbet] No game list intercepted — Cloudflare may have blocked the request');
-      return false;
-    }
-
-    // Use the largest result set
-    const best = candidates.sort((a, b) => b.games.length - a.games.length)[0];
-    console.log(`[rainbet] Using ${best.games.length} games from ${best.url}`);
-
-    const mapped = best.games.map(g => ({
-      name: g.name || g.title || g.game_name || '',
-      slug: g.slug || g.id || g.identifier || g.game_id || '',
-      provider: g.provider || g.provider_name || g.studio || '',
-      thumbUrl: g.image || g.thumbnail || g.img || g.cover || g.icon || g.logo || null,
-    })).filter(g => g.name);
-
-    // Deduplicate by name
-    const seen = new Set();
-    rainbetGames = mapped.filter(g => {
-      const key = g.name.toLowerCase().trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
-
-    saveRainbetCache();
-    console.log(`[rainbet] Done — ${rainbetGames.length} unique games`);
-    return true;
-  } catch(e) {
-    console.error('[rainbet] Scrape failed:', e.message);
-    return false;
-  } finally {
-    if (browser) await browser.close().catch(() => {});
-  }
-}
-
-// Startup: load cache or scrape in background
-if (!loadRainbetCache()) {
-  scrapeRainbetGames().catch(() => {});
-}
-// Daily refresh
-setInterval(() => {
-  console.log('[rainbet] Daily refresh...');
-  scrapeRainbetGames().catch(() => {});
-}, 24 * 60 * 60 * 1000);
-
 // ── Slot Autocomplete ─────────────────────────────────────────────
-const SLOTS_FILE = path.join(__dirname, 'slots_cache.json');
 let slotCache = { games: [], fetchedAt: 0 };
-let validatedGames = []; // all games with resolved thumbUrl (thumb or start fallback, null if neither)
-let thumbValidationDone = false;
-const ONE_DAY = 24 * 60 * 60 * 1000;
-
-const SLOTS_CACHE_VERSION = 4; // bump to force re-validation
-
-function loadSlotsCache() {
-  try {
-    if (fs.existsSync(SLOTS_FILE)) {
-      const data = JSON.parse(fs.readFileSync(SLOTS_FILE, 'utf8'));
-      if (data.version === SLOTS_CACHE_VERSION && data.validatedAt && Date.now() - data.validatedAt < ONE_DAY && Array.isArray(data.games) && data.games.length > 0) {
-        validatedGames = data.games;
-        thumbValidationDone = true;
-        console.log(`[slots] Loaded ${validatedGames.length} validated slots from cache (${Math.round((Date.now()-data.validatedAt)/3600000)}h old)`);
-        return true; // cache is fresh, no need to re-validate
-      }
-    }
-  } catch(e) { console.error('[slots] Failed to load slots cache:', e.message); }
-  return false; // cache missing or stale
-}
-
-function saveSlotsCache() {
-  try {
-    fs.writeFileSync(SLOTS_FILE, JSON.stringify({ version: SLOTS_CACHE_VERSION, validatedAt: Date.now(), games: validatedGames }, null, 2));
-    console.log(`[slots] Saved ${validatedGames.length} slots to cache`);
-  } catch(e) { console.error('[slots] Failed to save slots cache:', e.message); }
-}
 
 async function getSlotGames() {
   const ONE_HOUR = 60 * 60 * 1000;
@@ -663,78 +497,22 @@ async function getSlotGames() {
     const res = await fetch('https://slot.report/api/v1/slots.json');
     const data = await res.json();
     slotCache.games = (data.results || []).filter(s => s.name);
-    // Deduplicate by name (keep first occurrence)
-    const seen = new Set();
-    slotCache.games = slotCache.games.filter(g => {
-      const key = g.name.toLowerCase().trim();
-      if (seen.has(key)) return false;
-      seen.add(key);
-      return true;
-    });
     slotCache.fetchedAt = Date.now();
-    console.log(`[slots] Fetched ${slotCache.games.length} slots from slot.report`);
+    console.log(`[slots] Cached ${slotCache.games.length} slots`);
   } catch(e) {
     console.error('[slots] Failed to fetch slot list:', e.message);
   }
   return slotCache.games;
 }
 
-async function validateAllThumbs() {
-  const games = await getSlotGames();
-  console.log(`[slots] Validating thumbnails for ${games.length} slots...`);
-  const BASE = 'https://slot.report/images/slots';
-  const BATCH = 50;
-  const results = [];
-  for (let i = 0; i < games.length; i += BATCH) {
-    const batch = games.slice(i, i + BATCH);
-    const checked = await Promise.all(batch.map(async g => {
-      try {
-        const thumbUrl = `${BASE}/${g.slug}-thumb.webp`;
-        const r = await fetch(thumbUrl, { method: 'HEAD' });
-        if (r.ok) return { ...g, thumbUrl };
-        // Fall back to -start.webp (gameplay screenshot — exists for virtually all slots)
-        const startUrl = `${BASE}/${g.slug}-start.webp`;
-        const r2 = await fetch(startUrl, { method: 'HEAD' });
-        return { ...g, thumbUrl: r2.ok ? startUrl : null };
-      } catch { return { ...g, thumbUrl: null }; }
-    }));
-    results.push(...checked);
-    if (i % 1000 === 0 && i > 0) console.log(`[slots] Validated ${i}/${games.length}...`);
-  }
-  validatedGames = results;
-  thumbValidationDone = true;
-  const withThumb = results.filter(g => g.thumbUrl).length;
-  saveSlotsCache();
-  console.log(`[slots] Done — ${withThumb}/${games.length} slots have thumbnails, ${games.length - withThumb} without`);
-}
-
-// On startup: load from cache if fresh, otherwise re-validate in background
-const cacheLoaded = loadSlotsCache();
-if (!cacheLoaded) {
-  // Run full validation in background — autocomplete works with unvalidated list in the meantime
-  getSlotGames().then(() => validateAllThumbs()).catch(() => {});
-} else {
-  // Cache is fresh, but still check once a day for new slots in the background
-  setTimeout(() => {
-    getSlotGames().then(() => validateAllThumbs()).catch(() => {});
-  }, ONE_DAY);
-}
-
-// Also schedule daily refresh
-setInterval(() => {
-  console.log('[slots] Daily refresh — re-validating thumbnails...');
-  getSlotGames().then(() => validateAllThumbs()).catch(() => {});
-}, ONE_DAY);
+// Pre-fetch on startup
+getSlotGames().catch(() => {});
 
 app.get('/api/slots/search', async (req, res) => {
   const q = (req.query.q || '').toLowerCase().trim();
   if (!q || q.length < 2) return res.json([]);
-
-  // Prefer Rainbet list (exact casino catalog); fall back to slot.report
-  const useRainbet = rainbetGames.length > 0;
-  const games = useRainbet ? rainbetGames
-    : (thumbValidationDone ? validatedGames : await getSlotGames());
-
+  const names = await getSlotNames();
+  const games = await getSlotGames();
   const results = games
     .filter(g => g.name.toLowerCase().includes(q))
     .sort((a, b) => {
@@ -749,10 +527,8 @@ app.get('/api/slots/search', async (req, res) => {
       name: g.name,
       slug: g.slug,
       provider: g.provider_slug || g.provider?.toLowerCase().replace(/[^a-z0-9]/g,'') || '',
-      thumb: useRainbet ? g.thumbUrl
-        : (thumbValidationDone ? g.thumbUrl : `https://slot.report/images/slots/${g.slug}-thumb.webp`)
+      thumb: `https://usercontent.cc/images/games/${g.provider_slug || ''}/${g.slug}.webp`
     }));
-
   res.json(results);
 });
 
