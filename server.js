@@ -15,11 +15,22 @@ const io     = new Server(server, {
 const PORT           = process.env.PORT || 3001;
 const FRONTEND_URL   = process.env.FRONTEND_URL || 'http://localhost:3000';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'beanhunt-secret';
-const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,mcflurry,mihallimou,missingiscool,cuda').toLowerCase().split(',').map(s=>s.trim());
-const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage').toLowerCase().split(',').map(s=>s.trim());
+const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,mcflurry,mihallimou,missingiscool,cuda,cabbage').toLowerCase().split(',').map(s=>s.trim());
+const ADMIN_IDS      = (process.env.ADMIN_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
+const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage,cabbage').toLowerCase().split(',').map(s=>s.trim());
+const VIP_IDS        = (process.env.VIP_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 function nameOf(user) { return (user?.displayName || user?.username || '').toLowerCase().trim(); }
-function isAdmin(user) { return user ? ADMINS.includes(nameOf(user)) : false; }
+function isAdmin(user) {
+  if (!user) return false;
+  if (user.id && ADMIN_IDS.includes(user.id)) return true;
+  return ADMINS.includes(nameOf(user));
+}
+function isVipHost(user) {
+  if (!user) return false;
+  if (user.id && VIP_IDS.includes(user.id)) return true;
+  return VIP_HOSTS.includes(nameOf(user));
+}
 function canEditHunt(user, huntOwnerId) {
   if (!user) return false;
   if (isAdmin(user)) return true;
@@ -88,7 +99,7 @@ app.get('/auth/discord/callback',
     const userData = Buffer.from(JSON.stringify({
       id: req.user.id, username: req.user.username,
       displayName: req.user.displayName, avatar: req.user.avatar,
-      isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||VIP_HOSTS.includes(nameOf(req.user))
+      isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||isVipHost(req.user)
     })).toString('base64');
     const returnTo = req.session?.returnTo || '/hunt';
     delete req.session?.returnTo;
@@ -99,7 +110,7 @@ app.get('/auth/discord/callback',
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect(FRONTEND_URL)));
 app.get('/auth/me', (req, res) => {
   if (!req.user) return res.json({ user: null });
-  res.json({ user: { ...req.user, isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||VIP_HOSTS.includes(nameOf(req.user)) } });
+  res.json({ user: { ...req.user, isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||isVipHost(req.user) } });
 });
 
 // ── State ──────────────────────────────────────────────────────────
@@ -122,7 +133,6 @@ function huntSummary(h) {
 function getPublicHunts()  { return Object.values(hunts).filter(h=>h.isLive).map(huntSummary); }
 function getAllHunts()      { return Object.values(hunts).map(huntSummary); }
 function emitHubUpdate()   { io.emit('hub:update', getPublicHunts()); }
-function emitHuntUpdate(userId) { const h = hunts[userId]; if (h) io.to(`hunt:${userId}`).emit('hunt:update', h); }
 
 function requireAuth(req, res, next)  { if (!req.user) return res.status(401).json({error:'Not authenticated'}); next(); }
 function requireAdmin(req, res, next) { if (!req.user||!isAdmin(req.user)) return res.status(403).json({error:'Admin only'}); next(); }
@@ -164,7 +174,7 @@ app.get('/api/my-hunt', requireAuth, (req, res) => res.json(hunts[req.user.id] |
 
 app.post('/api/my-hunt/start', requireAuth, (req, res) => {
   const { huntType = 'community' } = req.body;
-  if (huntType === 'vip' && !isAdmin(req.user) && !VIP_HOSTS.includes(nameOf(req.user)))
+  if (huntType === 'vip' && !isAdmin(req.user) && !isVipHost(req.user))
     return res.status(403).json({error:'Not authorised for VIP hunts'});
   hunts[req.user.id] = {
     user: req.user, isLive: false, startedAt: null, archivedAt: null,
@@ -210,7 +220,7 @@ app.put('/api/my-hunt', requireAuth, (req, res) => {
   if (equity    !== undefined) hunts[req.user.id].equity    = equity;
   if (calls     !== undefined) hunts[req.user.id].calls     = calls;
   if (huntType  !== undefined) {
-    if (huntType === 'vip' && !isAdmin(req.user) && !VIP_HOSTS.includes(nameOf(req.user)))
+    if (huntType === 'vip' && !isAdmin(req.user) && !isVipHost(req.user))
       return res.status(403).json({error:'Not authorised for VIP hunt'});
     hunts[req.user.id].huntType = huntType;
   }
@@ -286,14 +296,13 @@ app.put('/api/hunts/:userId', requireAuth, (req, res) => {
   if (!canEditHunt(req.user, req.params.userId)) return res.status(403).json({error:'Not authorised'});
   const hunt = hunts[req.params.userId];
   if (!hunt) return res.status(404).json({error:'Hunt not found'});
-  const { bonuses, equity, calls, huntType, callLimit, huntMode, roundRobin } = req.body;
-  if (bonuses     !== undefined) hunt.bonuses     = bonuses;
-  if (equity      !== undefined) hunt.equity      = equity;
-  if (calls       !== undefined) hunt.calls       = calls;
-  if (huntType    !== undefined) hunt.huntType    = huntType;
-  if (callLimit   !== undefined) hunt.callLimit   = callLimit;
-  if (huntMode    !== undefined) hunt.huntMode    = huntMode;
-  if (roundRobin  !== undefined) hunt.roundRobin  = roundRobin;
+  const { bonuses, equity, calls, huntType, callLimit, huntMode } = req.body;
+  if (bonuses   !== undefined) hunt.bonuses   = bonuses;
+  if (equity    !== undefined) hunt.equity    = equity;
+  if (calls     !== undefined) hunt.calls     = calls;
+  if (huntType  !== undefined) hunt.huntType  = huntType;
+  if (callLimit !== undefined) hunt.callLimit = callLimit;
+  if (huntMode  !== undefined) hunt.huntMode  = huntMode;
   io.to(`hunt:${req.params.userId}`).emit('hunt:update', hunt);
   emitHubUpdate();
   res.json({ok:true});
