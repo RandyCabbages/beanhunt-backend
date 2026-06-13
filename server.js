@@ -53,18 +53,37 @@ function isEquityMember(user, huntOwnerId) {
   if (!user) return false;
   const hunt = hunts[huntOwnerId];
   if (!hunt) return false;
-  const name = nameOf(user);
-  // Also check callsPermissions (granted via request)
+  // Check callsPermissions (explicitly granted via request)
   if (user?.id && hunt.callsPermissions && hunt.callsPermissions.includes(user.id)) return true;
-  // Match on Discord ID first (most reliable), then name fuzzy match
   const userId = user?.id;
-  const nameNoSpaces = name.replace(/\s+/g,'');
+  // Build all name variants for this user to match against
+  const displayName = (user.displayName || '').toLowerCase().trim();
+  const username    = (user.username    || '').toLowerCase().trim();
+  const candidates  = new Set([
+    displayName,
+    username,
+    displayName.replace(/\s+/g,''),
+    username.replace(/\s+/g,''),
+    // strip trailing numbers/symbols often appended to Discord names
+    displayName.replace(/[\d_\-\.]+$/,'').trim(),
+    username.replace(/[\d_\-\.]+$/,'').trim(),
+  ].filter(Boolean));
+
   return hunt.equity.some(e => {
     if (!e.name && !e.discordId) return false;
+    // Discord ID match (most reliable — set after auto-link)
     if (userId && e.discordId && e.discordId === userId) return true;
+    // Name match — compare equity entry name against all user name variants
     const en = (e.name||'').toLowerCase().trim();
-    const enNoSpaces = en.replace(/\s+/g,'');
-    return en === name || enNoSpaces === nameNoSpaces || en === nameNoSpaces || enNoSpaces === name;
+    const enNoSp = en.replace(/\s+/g,'');
+    for (const c of candidates) {
+      if (!c) continue;
+      if (c === en || c === enNoSp) return true;
+      // Equity name starts with or is contained in user's name (or vice versa)
+      // e.g. equity "walker" matches Discord "WalkerGames" or "walker_123"
+      if (c.startsWith(en) || en.startsWith(c)) return true;
+    }
+    return false;
   });
 }
 
@@ -197,22 +216,34 @@ app.get('/api/hunts/:userId', (req, res) => {
     return res.status(404).json({error:'Hunt not live'});
   const canEdit  = req.user ? canEditHunt(req.user, req.params.userId) : false;
 
-  // Auto-link: when a logged-in viewer visits, match their Discord name to an equity entry and store their ID
+  // Auto-link: when a logged-in viewer visits, match their Discord name to an equity entry and store their Discord ID
+  // This makes subsequent isEquityMember checks use the reliable ID-based path
   if (req.user?.id && hunt.equity) {
-    const vName = nameOf(req.user);
-    const vNoSp = vName.replace(/\s+/g,'');
+    const displayName = (req.user.displayName || '').toLowerCase().trim();
+    const username    = (req.user.username    || '').toLowerCase().trim();
+    const candidates  = new Set([
+      displayName, username,
+      displayName.replace(/\s+/g,''), username.replace(/\s+/g,''),
+      displayName.replace(/[\d_\-\.]+$/,'').trim(),
+      username.replace(/[\d_\-\.]+$/,'').trim(),
+    ].filter(Boolean));
     let linked = false;
     hunt.equity = hunt.equity.map(e => {
-      if (e.discordId) return e;
+      if (e.discordId) return e; // already linked
       const en = (e.name||'').toLowerCase().trim();
       const enNoSp = en.replace(/\s+/g,'');
-      if (en===vName||enNoSp===vNoSp||en===vNoSp||enNoSp===vName) {
+      let matches = false;
+      for (const c of candidates) {
+        if (!c) continue;
+        if (c === en || c === enNoSp || c.startsWith(en) || en.startsWith(c)) { matches = true; break; }
+      }
+      if (matches) {
         linked = true;
         return { ...e, discordId: req.user.id, name: req.user.displayName || e.name };
       }
       return e;
     });
-    if (linked) emitHuntUpdate(req.params.userId);
+    if (linked) { persistHunts(); emitHuntUpdate(req.params.userId); }
   }
 
   const canCalls = req.user ? (canEdit || isEquityMember(req.user, req.params.userId)) : false;
