@@ -456,7 +456,7 @@ app.put('/api/settings', requireAuth, async (req, res) => {
   const current = await getSettings(req.user.id);
   const { rainbetName, preferredSlots } = req.body;
   if (rainbetName !== undefined)    current.rainbetName    = String(rainbetName).trim().slice(0, 64);
-  if (preferredSlots !== undefined) current.preferredSlots = (preferredSlots || []).slice(0, 8);
+  if (preferredSlots !== undefined) current.preferredSlots = (preferredSlots || []).filter(Boolean);
   await saveSettings(req.user.id, current);
   res.json({ ok: true, settings: current });
 });
