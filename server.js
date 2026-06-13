@@ -424,10 +424,9 @@ app.put('/api/settings', requireAuth, (req, res) => {
   res.json({ ok: true, settings: userSettings[req.user.id] });
 });
 
-// GET /api/settings/:userId — get another user's preferred slots (for auto-injection)
+// GET /api/settings/:userId — get another user's preferred slots by Discord ID
 app.get('/api/settings/:userId', requireAuth, (req, res) => {
   const s = userSettings[req.params.userId] || { rainbetName: '', preferredSlots: [] };
-  // Only return preferred slots publicly, not rainbet name
   res.json({ preferredSlots: s.preferredSlots || [] });
 });
 
