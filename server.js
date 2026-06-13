@@ -109,7 +109,11 @@ app.get('/auth/discord/callback',
       displayName: req.user.displayName, avatar: req.user.avatar,
       isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||isVipHost(req.user)
     })).toString('base64');
-    res.redirect(`${FRONTEND_URL}/?auth=${encodeURIComponent(userData)}`);
+    const returnTo = req.session.returnTo || '/';
+    delete req.session.returnTo;
+    // Encode returnTo as a query param so frontend can redirect after auth
+    const returnParam = returnTo !== '/' ? `&returnTo=${encodeURIComponent(returnTo)}` : '';
+    res.redirect(`${FRONTEND_URL}/?auth=${encodeURIComponent(userData)}${returnParam}`);
   }
 );
 app.get('/auth/logout', (req, res) => req.logout(() => res.redirect(FRONTEND_URL)));
