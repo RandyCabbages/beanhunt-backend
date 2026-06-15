@@ -91,10 +91,36 @@ function isEquityMember(user, huntOwnerId) {
 app.set('trust proxy', 1);
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
-app.use(session({
-  secret: SESSION_SECRET, resave: false, saveUninitialized: false,
+
+// Postgres pool — shared by session store and user_settings
+const { Pool } = require('pg');
+let pgPool = null;
+if (process.env.DATABASE_URL) {
+  pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  console.log('[pg] Pool created');
+} else {
+  console.log('[pg] No DATABASE_URL — sessions and settings will be in-memory only (will reset on redeploy)');
+}
+
+// Session config — Postgres-backed if pool is available, otherwise in-memory
+const sessionConfig = {
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
   cookie: { secure: true, sameSite: 'none', maxAge: 7 * 24 * 60 * 60 * 1000 }
-}));
+};
+if (pgPool) {
+  const pgSession = require('connect-pg-simple')(session);
+  sessionConfig.store = new pgSession({
+    pool: pgPool,
+    tableName: 'user_sessions',
+    createTableIfMissing: true,
+  });
+  console.log('[session] Using Postgres session store (persists across redeploys)');
+} else {
+  console.log('[session] Using in-memory session store (will reset on redeploy)');
+}
+app.use(session(sessionConfig));
 app.use(passport.initialize());
 app.use(passport.session());
 
@@ -428,20 +454,15 @@ app.delete('/api/admin/hunts/:userId', requireAdmin, (req, res) => {
 
 // ── User Settings ──────────────────────────────────────────────────
 // ── User Settings (Postgres-backed) ───────────────────────────────
-// Falls back to in-memory if DATABASE_URL not set
-const { Pool } = require('pg');
-let pgPool = null;
-if (process.env.DATABASE_URL) {
-  pgPool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
+// Uses shared pgPool created at middleware setup. Falls back to file if no pool.
+if (pgPool) {
   pgPool.query(`
     CREATE TABLE IF NOT EXISTS user_settings (
       user_id TEXT PRIMARY KEY,
       settings JSONB NOT NULL DEFAULT '{}'
     )
   `).then(() => console.log('[settings] Postgres table ready'))
-    .catch(e => { console.error('[settings] Postgres init failed:', e.message); pgPool = null; });
-} else {
-  console.log('[settings] No DATABASE_URL — using in-memory settings (will reset on redeploy)');
+    .catch(e => console.error('[settings] Postgres init failed:', e.message));
 }
 
 const SETTINGS_FILE = path.join(__dirname, 'user_settings.json');
