@@ -373,6 +373,11 @@ function huntSummary(h) {
     bonusCount: h.bonuses.length,
     totalWon: h.bonuses.reduce((s,b)=>s+b.win,0),
     pot: h.equity.reduce((s,e)=>s+e.amount,0),
+    // Include the equity list ONLY for archived hunts — needed for per-member all-time-payout
+    // calculation on the equity cards. Live hunts omit it (bandwidth + don't expose equity publicly).
+    equity: h.archivedAt
+      ? (h.equity || []).map(e => ({ id: e.id, name: e.name, amount: e.amount, isRollWinner: !!e.isRollWinner, isMod: !!e.isMod }))
+      : undefined,
     viewers: viewers[h.user.id]||0,
     huntMode: h.huntMode||'creating',
     rolledCount: (h.bonuses||[]).filter(b=>b.win>0).length,
