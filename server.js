@@ -10,12 +10,25 @@ const path            = require('path');
 
 const app    = express();
 const server = http.createServer(app);
-const io     = new Server(server, {
-  cors: { origin: process.env.FRONTEND_URL || 'http://localhost:3000', credentials: true }
-});
 
-const PORT           = process.env.PORT || 3001;
-const FRONTEND_URL   = process.env.FRONTEND_URL || 'http://localhost:3000';
+const PORT         = process.env.PORT || 3001;
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+// Support comma-separated list of allowed origins (e.g. for domain migrations)
+const ALLOWED_ORIGINS = [
+  ...new Set([
+    FRONTEND_URL,
+    'https://communityhunts.gg',
+    ...(process.env.EXTRA_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean),
+  ])
+];
+function corsOrigin(origin, callback) {
+  if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  callback(new Error('Not allowed by CORS'));
+}
+
+const io = new Server(server, {
+  cors: { origin: corsOrigin, credentials: true }
+});
 const SESSION_SECRET = process.env.SESSION_SECRET || 'beanhunt-secret';
 const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,mcflurry,mihallimou,missingiscool,cuda,cabbage,goofer').toLowerCase().split(',').map(s=>s.trim());
 const ADMIN_IDS      = (process.env.ADMIN_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
@@ -129,7 +142,7 @@ function isEquityMember(user, huntOwnerId) {
 
 // ── Middleware ─────────────────────────────────────────────────────
 app.set('trust proxy', 1);
-app.use(cors({ origin: FRONTEND_URL, credentials: true }));
+app.use(cors({ origin: corsOrigin, credentials: true }));
 app.use(express.json());
 
 // Postgres pool — shared by session store and user_settings
