@@ -847,10 +847,50 @@ app.post('/api/admin/set-rainbet-name', requireAdmin, async (req, res) => {
 
 
 
+// Resolve a member name (Discord username/displayName) to an existing settings userId.
+// Returns null if no row matches — caller may fall back to a synthetic manual: id.
+// Uses the same matching rules as GET /api/settings/by-name/:name.
+async function resolveUserIdByName(name) {
+  const search = (name || '').toLowerCase().trim();
+  if (!search) return null;
+  const searchNoSp = search.replace(/\s+/g, '');
+  let rows = [];
+  if (pgPool) {
+    try {
+      const r = await pgPool.query('SELECT user_id, settings FROM user_settings');
+      rows = r.rows.map(row => ({ userId: row.user_id, ...row.settings }));
+    } catch (e) { console.error('[settings] resolveUserIdByName pg error:', e.message); }
+  }
+  if (!rows.length) {
+    rows = Object.entries(userSettings).map(([uid, s]) => ({ userId: uid, ...s }));
+  }
+  // Prefer real Discord-id rows (17-19 digit ids) over synthetic manual: rows so we keep
+  // identity attached to the real account when both happen to exist.
+  rows.sort((a, b) => {
+    const aReal = /^\d{17,19}$/.test(a.userId) ? 0 : 1;
+    const bReal = /^\d{17,19}$/.test(b.userId) ? 0 : 1;
+    return aReal - bReal;
+  });
+  const match = rows.find(s => {
+    const candidates = [
+      (s.discordUsername    || '').toLowerCase().trim(),
+      (s.discordDisplayName || '').toLowerCase().trim(),
+    ].filter(Boolean);
+    const noSp = candidates.map(c => c.replace(/\s+/g, ''));
+    for (const c of candidates.concat(noSp)) {
+      if (!c) continue;
+      if (c === search || c === searchNoSp) return true;
+      if (c.startsWith(search) || search.startsWith(c)) return true;
+    }
+    return false;
+  });
+  return match ? match.userId : null;
+}
+
 // POST /api/admin/set-user-field — let an admin manually set a per-user identity field
 // (rainbetName or twitchName) for someone else. Accepts either { userId, field, value } or
-// { name, field, value }. Name-only path uses synthetic id keyed on the lowercased name so
-// the existing by-name lookup will match it later via discordDisplayName.
+// { name, field, value }. Name-only path first tries to resolve to an existing settings row
+// so writes hit the same record reads find; falls back to a synthetic manual: id when missing.
 app.post('/api/admin/set-user-field', requireAdmin, async (req, res) => {
   const field = String(req.body?.field || '').trim();
   if (!['rainbetName', 'twitchName'].includes(field))
@@ -866,6 +906,14 @@ app.post('/api/admin/set-user-field', requireAdmin, async (req, res) => {
     current[field] = value;
     await saveSettings(userId, current);
     return res.json({ ok: true, scope: 'userId', userId, field, value });
+  }
+
+  const resolvedId = await resolveUserIdByName(name);
+  if (resolvedId) {
+    const current = await getSettings(resolvedId);
+    current[field] = value;
+    await saveSettings(resolvedId, current);
+    return res.json({ ok: true, scope: 'resolved', name, userId: resolvedId, field, value });
   }
 
   const syntheticId = `manual:${name.toLowerCase()}`;
@@ -902,6 +950,14 @@ app.post('/api/admin/set-preferred-slots', requireAdmin, async (req, res) => {
     current.preferredSlots = cleaned;
     await saveSettings(userId, current);
     return res.json({ ok: true, scope: 'userId', userId, count: cleaned.length });
+  }
+
+  const resolvedId = await resolveUserIdByName(name);
+  if (resolvedId) {
+    const current = await getSettings(resolvedId);
+    current.preferredSlots = cleaned;
+    await saveSettings(resolvedId, current);
+    return res.json({ ok: true, scope: 'resolved', name, userId: resolvedId, count: cleaned.length });
   }
 
   const syntheticId = `manual:${name.toLowerCase()}`;
