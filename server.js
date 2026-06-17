@@ -17,9 +17,9 @@ const io     = new Server(server, {
 const PORT           = process.env.PORT || 3001;
 const FRONTEND_URL   = process.env.FRONTEND_URL || 'http://localhost:3000';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'beanhunt-secret';
-const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,mcflurry,mihallimou,missingiscool,cuda,cabbage').toLowerCase().split(',').map(s=>s.trim());
+const ADMINS         = (process.env.ADMINS || 'bean,randycabbage,randy cabbage,mcflurry,mihallimou,missingiscool,cuda,cabbage,goofer').toLowerCase().split(',').map(s=>s.trim());
 const ADMIN_IDS      = (process.env.ADMIN_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
-const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage,cabbage').toLowerCase().split(',').map(s=>s.trim());
+const VIP_HOSTS      = (process.env.VIP_HOSTS || 'bean,mcflurry,mihallimou,missingiscool,cuda,randycabbage,cabbage,goofer').toLowerCase().split(',').map(s=>s.trim());
 const VIP_IDS        = (process.env.VIP_IDS || '').split(',').map(s=>s.trim()).filter(Boolean);
 
 function nameOf(user) { return (user?.displayName || user?.username || '').toLowerCase().trim(); }
@@ -606,6 +606,18 @@ app.post('/api/admin/hunts/:userId/end', requireAdmin, (req, res) => {
 app.delete('/api/admin/hunts/:userId', requireAdmin, (req, res) => {
   if (!hunts[req.params.userId]) return res.status(404).json({error:'Not found'});
   delete hunts[req.params.userId]; emitHubUpdate();
+  res.json({ok:true});
+});
+
+// Delete an archived hunt. Two archived hunts can share a userId (same user, multiple completed hunts),
+// so we need archivedAt as a tiebreaker to identify the exact entry.
+app.delete('/api/admin/hunts/archived/:userId/:archivedAt', requireAdmin, (req, res) => {
+  const { userId, archivedAt } = req.params;
+  const idx = archive.findIndex(h => h.user?.id === userId && h.archivedAt === archivedAt);
+  if (idx === -1) return res.status(404).json({error:'Archived hunt not found'});
+  archive.splice(idx, 1);
+  persistArchive();
+  emitHubUpdate();
   res.json({ok:true});
 });
 
