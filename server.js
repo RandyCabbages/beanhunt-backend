@@ -266,125 +266,15 @@ app.get('/api/known-users', async (req, res) => {
 });
 
 // ── State ──────────────────────────────────────────────────────────
-const HUNTS_FILE   = path.join(__dirname, 'hunts_data.json');
-const ARCHIVE_FILE = path.join(__dirname, 'hunts_archive.json');
-const hunts   = {};
-const archive = []; // completed hunts, newest first
 const viewers = {};
-let beanLive  = { isLive: false, title: '', updatedAt: null };
 
-// Initialize Postgres tables for hunts and archive
-let huntsTableReady = Promise.resolve();
-if (pgPool) {
-  huntsTableReady = pgPool.query(`
-    CREATE TABLE IF NOT EXISTS hunts_kv (
-      key TEXT PRIMARY KEY,
-      value JSONB NOT NULL
-    )
-  `).then(() => console.log('[persist] Postgres hunts_kv table ready'))
-    .catch(e => { console.error('[persist] hunts_kv init failed:', e.message); });
-}
-
-// Load persisted hunts on startup — try Postgres first, fall back to file
-async function loadPersistedState() {
-  let loadedFromPg = false;
-  if (pgPool) {
-    try {
-      await huntsTableReady;
-      const huntsRow = await pgPool.query("SELECT value FROM hunts_kv WHERE key='hunts'");
-      if (huntsRow.rows[0]) {
-        Object.assign(hunts, huntsRow.rows[0].value || {});
-        loadedFromPg = true;
-      }
-      const archiveRow = await pgPool.query("SELECT value FROM hunts_kv WHERE key='archive'");
-      if (archiveRow.rows[0]) {
-        archive.push(...(archiveRow.rows[0].value || []));
-      }
-      if (loadedFromPg) console.log(`[persist] Loaded ${Object.keys(hunts).length} hunts and ${archive.length} archived from Postgres`);
-    } catch(e) { console.error('[persist] PG load failed:', e.message); }
-  }
-  // Fallback: load from file if Postgres was empty/unavailable
-  if (!loadedFromPg) {
-    try {
-      if (fs.existsSync(HUNTS_FILE)) {
-        const saved = JSON.parse(fs.readFileSync(HUNTS_FILE, 'utf8'));
-        Object.assign(hunts, saved);
-        console.log(`[persist] Loaded ${Object.keys(hunts).length} hunts from file`);
-      }
-    } catch(e) { console.error('[persist] File load failed:', e.message); }
-    try {
-      if (fs.existsSync(ARCHIVE_FILE)) {
-        const saved = JSON.parse(fs.readFileSync(ARCHIVE_FILE, 'utf8'));
-        archive.push(...saved);
-        console.log(`[persist] Loaded ${archive.length} archived hunts from file`);
-      }
-    } catch(e) { console.error('[persist] Archive file load failed:', e.message); }
-  }
-
-  // Dedup calls one-time on load (cleanup from before normalization was added)
-  let totalRemoved = 0;
-  for (const id in hunts) {
-    const h = hunts[id];
-    if (h?.calls?.length) {
-      const seen = new Set();
-      const before = h.calls.length;
-      h.calls = h.calls.filter(c => {
-        const key = (c.slot || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-      totalRemoved += before - h.calls.length;
-    }
-  }
-  if (totalRemoved > 0) console.log(`[persist] Removed ${totalRemoved} duplicate calls on startup`);
-}
-loadPersistedState().then(() => startupBackfill()).catch(e => console.error('[persist] loadPersistedState error:', e.message));
-
-function persistHunts() {
-  // Bulletproof: dedupe call arrays before persisting. Keeps first occurrence of each slot.
-  for (const id in hunts) {
-    const h = hunts[id];
-    if (h?.calls?.length) {
-      const seen = new Set();
-      h.calls = h.calls.filter(c => {
-        const key = normalizeSlot(c.slot);
-        if (!key || seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      });
-    }
-  }
-  // Write to Postgres (durable across redeploys) AND file (local-dev fallback)
-  if (pgPool) {
-    pgPool.query(
-      "INSERT INTO hunts_kv(key,value) VALUES('hunts',$1) ON CONFLICT(key) DO UPDATE SET value=$1",
-      [JSON.stringify(hunts)]
-    ).catch(e => console.error('[persist] PG save hunts failed:', e.message));
-  }
-  try { fs.writeFileSync(HUNTS_FILE, JSON.stringify(hunts), 'utf8'); }
-  catch(e) { /* file write may fail on ephemeral disk; that's OK if PG works */ }
-}
-function persistArchive() {
-  if (pgPool) {
-    pgPool.query(
-      "INSERT INTO hunts_kv(key,value) VALUES('archive',$1) ON CONFLICT(key) DO UPDATE SET value=$1",
-      [JSON.stringify(archive)]
-    ).catch(e => console.error('[persist] PG save archive failed:', e.message));
-  }
-  try { fs.writeFileSync(ARCHIVE_FILE, JSON.stringify(archive), 'utf8'); }
-  catch(e) { /* file write may fail on ephemeral disk */ }
-}
-function archiveHunt(hunt) {
-  if (!hunt || !hunt.user) return;
-  // Don't archive empty hunts — no bonuses means there's nothing to analyze,
-  // and it keeps the archive/history from filling up with blank entries.
-  if (!Array.isArray(hunt.bonuses) || hunt.bonuses.length === 0) return;
-  // Save full hunt snapshot to archive (keep last 100)
-  archive.unshift({ ...hunt, archivedAt: hunt.archivedAt || new Date().toISOString() });
-  if (archive.length > 100) archive.splice(100);
-  persistArchive();
-}
+// Persistence layer (hunt/archive state + Postgres hunts_kv) lives in lib/persistence.js.
+// hunts/archive are shared singletons owned there — imported by reference, never reassigned.
+const persistence = require('./lib/persistence');
+const { hunts, archive, persistHunts, persistArchive, archiveHunt } = persistence;
+persistence.initPersistence({ pgPool, normalizeSlot })
+  .then(() => startupBackfill())
+  .catch(e => console.error('[persist] init error:', e.message));
 
 function huntSummary(h) {
   return {
@@ -1131,190 +1021,40 @@ app.post('/api/tickets', async (req, res) => {
   }
 });
 
-// ── Twitch live check ──────────────────────────────────────────────
-async function checkBeanLive() {
-  const cid = process.env.TWITCH_CLIENT_ID;
-  const sec = process.env.TWITCH_CLIENT_SECRET;
-  if (!cid || !sec) return;
-  try {
-    const tr = await fetch('https://id.twitch.tv/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: `client_id=${cid}&client_secret=${sec}&grant_type=client_credentials`
-    });
-    const td = await tr.json();
-    const sr = await fetch('https://api.twitch.tv/helix/streams?user_login=bean', {
-      headers: { 'Client-ID': cid, 'Authorization': `Bearer ${td.access_token}` }
-    });
-    const sd = await sr.json();
-    beanLive = { isLive: !!(sd.data?.length), title: sd.data?.[0]?.title||'', updatedAt: new Date().toISOString() };
-    io.emit('bean:live', beanLive);
-  } catch(e) { console.error('Twitch check error:', e.message); }
-}
-checkBeanLive();
-setInterval(checkBeanLive, 5 * 60 * 1000);
+// ── External integrations (Twitch live, leaderboard, Discord) ──────
+// Logic lives in lib/integrations.js; route declarations stay here and delegate.
+const integrations = require('./lib/integrations');
+integrations.startTwitchPolling(io);
 
-app.get('/api/bean-live', (req, res) => res.json(beanLive));
-
-// ── BeanTwitch leaderboard proxy ───────────────────────────────────
-// The beantwitch.com leaderboard API (https://api.beantwitch.com) is public
-// but CORS-allowlists only beantwitch.com, so the browser can't call it from
-// communityhunts.gg. We proxy it server-side, merge in prize/config metadata,
-// and cache the result so the homepage can render the synced standings.
-let lbCache = { data: null, fetchedAt: 0 };
-const LB_API = 'https://api.beantwitch.com';
-
-async function getLeaderboard() {
-  const CACHE_MS = 90 * 1000; // 90s — matches the upstream cache cadence
-  if (lbCache.data && Date.now() - lbCache.fetchedAt < CACHE_MS) return lbCache.data;
-
-  // beantwitch returns 500 unless the Origin is on its allowlist.
-  const headers = { 'User-Agent': 'Mozilla/5.0 Chrome/120', 'Origin': 'https://beantwitch.com', 'Accept': 'application/json' };
-  const [lbRes, cfgRes] = await Promise.all([
-    fetch(`${LB_API}/api/leaderboard`, { headers }),
-    fetch(`${LB_API}/api/config`,      { headers }),
-  ]);
-  if (!lbRes.ok)  throw new Error(`leaderboard upstream ${lbRes.status}`);
-  if (!cfgRes.ok) throw new Error(`config upstream ${cfgRes.status}`);
-  const lbJson  = await lbRes.json();
-  const cfg     = await cfgRes.json();
-
-  const prizes = Array.isArray(cfg.leaderboard_prizes) ? cfg.leaderboard_prizes : [];
-  const rows   = (lbJson?.data?.leaderboard || []).map(r => ({
-    rank:    r.rank,
-    player:  r.username,                 // already masked upstream (e.g. "2A***r")
-    wagered: r.wager,
-    prize:   prizes[r.rank - 1] ?? null, // prize by rank (1-indexed)
-  }));
-
-  const data = {
-    prizePool:   cfg.leaderboard_prize_pool ?? null,
-    currency:    cfg.currency || 'USD',
-    startDay:    cfg.leaderboard_start_day || null,
-    endDay:      cfg.leaderboard_end_day   || null,
-    syncedAt:    lbJson?.data?.cache_updated_at || null, // upstream cache timestamp
-    fetchedAt:   new Date().toISOString(),
-    standings:   rows,
-    fullUrl:     'https://beantwitch.com/leaderboard',
-  };
-  lbCache = { data, fetchedAt: Date.now() };
-  return data;
-}
+app.get('/api/bean-live', (req, res) => res.json(integrations.getBeanLive()));
 
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    res.json(await getLeaderboard());
+    res.json(await integrations.getLeaderboard());
   } catch (e) {
     console.error('[leaderboard] proxy error:', e.message);
     // Serve stale cache if we have it, so a transient upstream blip doesn't blank the panel.
-    if (lbCache.data) return res.json(lbCache.data);
+    const stale = integrations.getLeaderboardCache();
+    if (stale) return res.json(stale);
     res.status(502).json({ error: 'leaderboard unavailable' });
   }
 });
 
-// ── Health ─────────────────────────────────────────────────────────
-
-// ── Discord Import ────────────────────────────────────────────────
-const DISCORD_BOT_TOKEN       = process.env.DISCORD_BOT_TOKEN || '';
-const DISCORD_CALLS_CHANNEL   = process.env.DISCORD_CALLS_CHANNEL_ID || '';
-const DISCORD_WINNERS_CHANNEL = process.env.DISCORD_WINNERS_CHANNEL_ID || '';
-
-async function fetchDiscordMessages(channelId, limit = 100) {
-  if (!DISCORD_BOT_TOKEN || !channelId) throw new Error('Discord bot not configured');
-  const res = await fetch(`https://discord.com/api/v10/channels/${channelId}/messages?limit=${limit}`, {
-    headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}`, 'Content-Type': 'application/json' }
-  });
-  if (!res.ok) throw new Error(`Discord API error: ${res.status}`);
-  return res.json();
-}
-
-// Import slot calls from last 20 mins — anyone in the channel
+// Import slot calls from last 20 mins — only from equity members of the user's hunt.
 app.get('/api/discord/import-calls', requireAuth, async (req, res) => {
   try {
     const hunt = hunts[req.user.id];
     if (!hunt) return res.status(404).json({ error: 'No active hunt' });
-
-    const messages = await fetchDiscordMessages(DISCORD_CALLS_CHANNEL, 100);
-    const cutoff   = Date.now() - 20 * 60 * 1000;
-    const recent = messages.filter(m => new Date(m.timestamp).getTime() > cutoff);
-
-    // Both hunt types: only import calls from equity members
-    const equityNames = (hunt.equity || []).filter(e => e.name).map(e => e.name.toLowerCase().trim());
-
-    const imported = [];
-    const existingSlots = new Set((hunt.calls || []).map(c => normalizeSlot(c.slot)));
-
-    for (const msg of recent) {
-      const callerName = msg.member?.nick || msg.author?.global_name || msg.author?.username || '';
-      const author     = (msg.author?.username || '').toLowerCase().trim();
-      const nick       = (msg.member?.nick || '').toLowerCase().trim();
-      const globalName = (msg.author?.global_name || '').toLowerCase().trim();
-      const inEquity   = equityNames.some(n =>
-        n === author || n === nick || n === globalName ||
-        author.includes(n) || nick.includes(n) || n.includes(author)
-      );
-      if (!inEquity) continue;
-
-      // Strip @mentions and leading/trailing whitespace from content
-      let content = msg.content
-        .replace(/<@!?\d+>/g, '')   // strip discord @mentions
-        .replace(/@\w+/g, '')       // strip plain @mentions
-        .trim();
-
-      if (!content) continue;
-
-      // Split by comma or newline — each part is a slot call
-      const parts = content.split(/[,\n]/).map(p => p.trim()).filter(p => p.length > 1 && p.length < 80);
-
-      for (const part of parts) {
-        const slotName = part.replace(/^[#\-•*\d.]+\s*/, '').trim();
-        const nsName = normalizeSlot(slotName);
-        if (slotName && nsName && !existingSlots.has(nsName)) {
-          imported.push({
-            id: `dc_${msg.id}_${imported.length}`,
-            slot: slotName,
-            caller: callerName,
-            status: 'pending',
-            source: 'discord'
-          });
-          existingSlots.add(nsName);
-        }
-      }
-    }
-
-    res.json({ imported, count: imported.length });
+    res.json(await integrations.importCalls(hunt, normalizeSlot));
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-// Parse VIP winners from Discord — finds latest results message and extracts names
+// Parse VIP winners from Discord — finds latest results message and extracts names.
 app.get('/api/discord/parse-winners', requireAuth, async (req, res) => {
   try {
-    const messages = await fetchDiscordMessages(DISCORD_WINNERS_CHANNEL, 50);
-
-    // Find the most recent message containing winner results (has "#1" and "Checked-In")
-    const resultsMsg = messages.find(m =>
-      m.content.includes('Checked-In') && m.content.includes('#1')
-    );
-    if (!resultsMsg) return res.json({ winners: [], count: 0, raw: 'No results message found in last 50 messages' });
-
-    // Parse lines like: #1    Jaycsk    144.949925    +45    Checked-In
-    const winners = [];
-    const lines = resultsMsg.content.split('\n');
-    for (const line of lines) {
-      const match = line.match(/^#(\d+)\s+(.+?)\s+(\d+\.\d+)\s+([+-]?\d+)/);
-      if (match) {
-        winners.push({
-          place: parseInt(match[1]),
-          name:  match[2].trim(),
-          roll:  parseFloat(match[3]),
-          luck:  parseInt(match[4]),
-        });
-      }
-    }
-
-    res.json({ winners, count: winners.length });
+    res.json(await integrations.parseWinners());
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -1659,7 +1399,7 @@ io.on('connection', socket => {
   socket.on('watch:hub', () => {
     socket.join('hub');
     socket.emit('hub:update', getPublicHunts());
-    socket.emit('bean:live', beanLive);
+    socket.emit('bean:live', integrations.getBeanLive());
   });
 
   socket.on('watch:hunt', userId => {
