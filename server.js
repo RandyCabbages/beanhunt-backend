@@ -417,6 +417,41 @@ function uid() { return Math.random().toString(36).slice(2, 8); }
 app.get('/api/hunts',          (req, res) => res.json(getPublicHunts()));
 app.get('/api/hunts/archived', (req, res) => res.json(getArchivedHunts()));
 
+// Recent "bangers" — individual slot hits at/above the multiplier threshold,
+// gathered from live + archived hunts. Powers the Hub highlight reel.
+const BANGER_MIN_MULT = 300;
+app.get('/api/bangers', (req, res) => {
+  const out = [], seen = new Set();
+  const collect = (h, live) => {
+    if (!h || !h.user || !Array.isArray(h.bonuses)) return;
+    const at = h.archivedAt || h.startedAt || null;
+    for (const b of h.bonuses) {
+      const bet = +b.bet || 0, win = +b.win || 0;
+      if (bet <= 0 || win <= 0) continue;
+      const mult = win / bet;
+      if (mult < BANGER_MIN_MULT) continue;
+      const key = `${h.user.id}|${(b.slot||'').toLowerCase()}|${bet}|${win}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        slot: b.slot || 'Unknown', bet, win, mult: +mult.toFixed(2),
+        userId: h.user.id, username: h.user.displayName, avatar: h.user.avatar,
+        huntType: h.huntType || 'community', live: !!live,
+        at, archivedAt: h.archivedAt || null,
+      });
+    }
+  };
+  // Live hunts first so their fresher copy wins the dedupe over an archived snapshot.
+  Object.values(hunts).forEach(h => { if (h.isLive) collect(h, true); });
+  archive.forEach(h => collect(h, false));
+  out.sort((a, b) => {
+    const ta = a.at ? new Date(a.at).getTime() : 0;
+    const tb = b.at ? new Date(b.at).getTime() : 0;
+    return tb - ta || b.mult - a.mult;
+  });
+  res.json(out.slice(0, 24));
+});
+
 // Fetch a specific archived hunt snapshot. One user can have many archived hunts so the
 // archivedAt timestamp is the tiebreaker. Always returned as readonly (canEdit/canAddCalls=false).
 app.get('/api/hunts/:userId/archived/:archivedAt', (req, res) => {
