@@ -198,6 +198,19 @@ app.use((req, res, next) => {
   next();
 });
 
+// Resolve the tenant for every /api request. Defaults to Bean when MULTI_TENANT is off
+// or no X-Tenant-Slug is sent (back-compat — the current frontend may not send it yet).
+function resolveTenant(req, res, next) {
+  const slug = req.headers['x-tenant-slug'] || req.query._tenant;
+  if (!MULTI_TENANT || !slug) { req.tenant = tenants.BEAN_TENANT; return next(); }
+  const t = tenants.getTenantBySlug(String(slug));
+  if (!t) return res.status(404).json({ error: 'Unknown tenant' });
+  req.tenant = t;
+  next();
+}
+// Mounted globally so /auth/me also gets tenant context for the isAdmin/isVipHost flags it returns.
+app.use(resolveTenant);
+
 // ── Passport ───────────────────────────────────────────────────────
 passport.use(new DiscordStrategy({
   clientID: process.env.DISCORD_CLIENT_ID,
@@ -228,7 +241,7 @@ app.get('/auth/discord/callback',
     const userData = Buffer.from(JSON.stringify({
       id: req.user.id, username: req.user.username,
       displayName: req.user.displayName, avatar: req.user.avatar,
-      isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||isVipHost(req.user)
+      isAdmin: reqIsAdmin(req), isVipHost: reqIsVipHost(req)
     })).toString('base64');
     const returnTo = req.session.returnTo || '/';
     delete req.session.returnTo;
@@ -244,7 +257,7 @@ app.get('/auth/me', (req, res) => {
   // Anyone who hits /auth/me with a valid session has logged in at some point.
   // Record (or refresh) them in known_users so they show up in equity autocomplete.
   recordKnownUser(req.user);
-  res.json({ user: { ...req.user, isAdmin: isAdmin(req.user), isVipHost: isAdmin(req.user)||isVipHost(req.user) } });
+  res.json({ user: { ...req.user, isAdmin: reqIsAdmin(req), isVipHost: reqIsVipHost(req) } });
 });
 
 // Public list of known users for equity-name autocomplete.
@@ -276,6 +289,11 @@ persistence.initPersistence({ pgPool, normalizeSlot })
   .then(() => startupBackfill())
   .catch(e => console.error('[persist] init error:', e.message));
 
+// Multi-tenancy config (tenants + roles). Gated by MULTI_TENANT; defaults to Bean.
+const tenants = require('./lib/tenants');
+const MULTI_TENANT = process.env.MULTI_TENANT === 'true';
+tenants.initTenants({ pgPool }).catch(e => console.error('[tenants] init error:', e.message));
+
 function huntSummary(h) {
   return {
     userId: h.user.id, username: h.user.displayName, avatar: h.user.avatar,
@@ -293,14 +311,19 @@ function huntSummary(h) {
     rolledCount: (h.bonuses||[]).filter(b=>b.win>0).length,
   };
 }
-function getPublicHunts()   { return Object.values(hunts).filter(h=>h.isLive).map(huntSummary); }
-function getArchivedHunts() { return archive.map(huntSummary); }
-function getAllHunts()       { return Object.values(hunts).map(huntSummary); }
-function emitHubUpdate()    { persistHunts(); io.emit('hub:update', getPublicHunts()); }
+function tenantOf(h) { return h.tenantId || 'bean'; } // untagged hunts belong to Bean (back-compat)
+function inTenant(h, tenantId) { return tenantOf(h) === (tenantId || 'bean'); }
+function getPublicHunts(tenantId)   { return Object.values(hunts).filter(h=>h.isLive && inTenant(h,tenantId)).map(huntSummary); }
+function getArchivedHunts(tenantId) { return archive.filter(h=>inTenant(h,tenantId)).map(huntSummary); }
+function getAllHunts(tenantId)       { return Object.values(hunts).filter(h=>inTenant(h,tenantId)).map(huntSummary); }
+function emitHubUpdate(tenantId)    { persistHunts(); io.to('hub:'+(tenantId||'bean')).emit('hub:update', getPublicHunts(tenantId)); }
 function emitHuntUpdate(userId) { const h = hunts[userId]; if (h) { persistHunts(); io.to(`hunt:${userId}`).emit('hunt:update', h); } }
 
 function requireAuth(req, res, next)  { if (!req.user) return res.status(401).json({error:'Not authenticated'}); next(); }
-function requireAdmin(req, res, next) { if (!req.user||!isAdmin(req.user)) return res.status(403).json({error:'Admin only'}); next(); }
+// Tenant-aware gates: when MULTI_TENANT is on, resolve against req.tenant; else the env-based globals.
+function reqIsAdmin(req)   { return MULTI_TENANT ? tenants.isTenantAdmin(req.user, req.tenant) : isAdmin(req.user); }
+function reqIsVipHost(req) { return MULTI_TENANT ? tenants.isTenantVip(req.user, req.tenant)   : (isAdmin(req.user)||isVipHost(req.user)); }
+function requireAdmin(req, res, next) { if (!req.user||!reqIsAdmin(req)) return res.status(403).json({error:'Admin only'}); next(); }
 function uid() { return Math.random().toString(36).slice(2, 8); }
 
 // Reject malformed / oversized hunt payloads (memory + DoS protection).
@@ -314,8 +337,8 @@ function rejectBadHuntInput(req, res) {
 }
 
 // ── Public hunt endpoints ──────────────────────────────────────────
-app.get('/api/hunts',          (req, res) => res.json(getPublicHunts()));
-app.get('/api/hunts/archived', (req, res) => res.json(getArchivedHunts()));
+app.get('/api/hunts',          (req, res) => res.json(getPublicHunts(req.tenant.id)));
+app.get('/api/hunts/archived', (req, res) => res.json(getArchivedHunts(req.tenant.id)));
 
 // Recent "bangers" — individual slot hits at/above the multiplier threshold,
 // gathered from live + archived hunts. Powers the Hub highlight reel.
@@ -418,14 +441,22 @@ app.get('/api/my-hunt', requireAuth, (req, res) => res.json(hunts[req.user.id] |
 
 // Seed equity when a hunt is created/reset: VIP starts with Bean, solo with
 // just the runner, community empty.
-function initialEquity(huntType, user) {
-  if (huntType === 'vip')  return [{id:'bean_auto',name:'Bean',amount:1000,isRollWinner:false}];
+function initialEquity(huntType, user, tenant) {
+  if (huntType === 'vip') {
+    const b = (tenant && tenant.branding) || {};
+    const hostName = b.hostName || 'Bean';
+    const hostId   = (tenant && tenant.hostDiscordId) || null;
+    // Interim id: keep 'bean_auto' for the Bean tenant so the live frontend's crown logic
+    // is unaffected until the frontend keys the crown off discordId/crownDiscordId.
+    const id = (tenant && tenant.slug && tenant.slug !== 'bean') ? `host_auto:${tenant.slug}` : 'bean_auto';
+    return [{ id, discordId: hostId, name: hostName, amount: 1000, isRollWinner: false }];
+  }
   if (huntType === 'solo') return [{id:'creator_auto',name:(user?.displayName||user?.username||''),amount:0,isRollWinner:false}];
   return [];
 }
 app.post('/api/my-hunt/start', requireAuth, (req, res) => {
   const { huntType = 'community' } = req.body;
-  if (huntType === 'vip' && !isAdmin(req.user) && !isVipHost(req.user))
+  if (huntType === 'vip' && !reqIsVipHost(req))
     return res.status(403).json({error:'Not authorised for VIP hunts'});
   // One active hunt per user: block a new hunt while the current one is still
   // live or has progress (bonuses/calls). The user must End or Reset it first.
@@ -440,8 +471,8 @@ app.post('/api/my-hunt/start', requireAuth, (req, res) => {
     archiveHunt(hunts[req.user.id]);
   }
   hunts[req.user.id] = {
-    user: req.user, isLive: false, startedAt: null, archivedAt: null,
-    huntType, bonuses: [], equity: initialEquity(huntType, req.user), calls: [], invitedEditors: [], callLimit: 10, huntMode: 'creating', roundRobin: true
+    user: req.user, isLive: false, startedAt: null, archivedAt: null, tenantId: req.tenant.id,
+    huntType, bonuses: [], equity: initialEquity(huntType, req.user, req.tenant), calls: [], invitedEditors: [], callLimit: 10, huntMode: 'creating', roundRobin: true
   };
   persistHunts();
   res.json({ok:true});
@@ -452,7 +483,7 @@ app.post('/api/my-hunt/golive', requireAuth, (req, res) => {
   hunts[req.user.id].isLive    = true;
   hunts[req.user.id].startedAt = new Date().toISOString();
   hunts[req.user.id].archivedAt= null;
-  emitHubUpdate(); // emitHubUpdate calls persistHunts
+  emitHubUpdate(req.tenant.id); // emitHubUpdate calls persistHunts
   io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
   res.json({ok:true});
 });
@@ -462,7 +493,7 @@ app.post('/api/my-hunt/end', requireAuth, (req, res) => {
     hunts[req.user.id].isLive    = false;
     hunts[req.user.id].archivedAt= new Date().toISOString();
     archiveHunt(hunts[req.user.id]);
-    emitHubUpdate();
+    emitHubUpdate(req.tenant.id);
     io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
   }
   res.json({ok:true});
@@ -477,17 +508,17 @@ app.post('/api/my-hunt/reset', requireAuth, (req, res) => {
   // Preserve the hunt type across a reset — resetting a VIP hunt should stay
   // VIP (re-seeded with Bean), not silently demote to community.
   const keepType = ['vip','solo'].includes(hunts[req.user.id]?.huntType) ? hunts[req.user.id].huntType : 'community';
-  hunts[req.user.id] = { user: req.user, isLive: false, startedAt: null, archivedAt: null,
-    huntType: keepType, bonuses: [], equity: initialEquity(keepType, req.user), calls: [], invitedEditors: [], callLimit: 10, huntMode: 'creating', roundRobin: true };
+  hunts[req.user.id] = { user: req.user, isLive: false, startedAt: null, archivedAt: null, tenantId: req.tenant.id,
+    huntType: keepType, bonuses: [], equity: initialEquity(keepType, req.user, req.tenant), calls: [], invitedEditors: [], callLimit: 10, huntMode: 'creating', roundRobin: true };
   persistHunts();
-  emitHubUpdate();
+  emitHubUpdate(req.tenant.id);
   res.json({ok:true});
 });
 
 app.put('/api/my-hunt', requireAuth, (req, res) => {
   if (rejectBadHuntInput(req, res)) return;
   if (!hunts[req.user.id]) hunts[req.user.id] = {
-    user: req.user, isLive: false, startedAt: null, archivedAt: null,
+    user: req.user, isLive: false, startedAt: null, archivedAt: null, tenantId: req.tenant.id,
     huntType: 'community', bonuses: [], equity: [], calls: [], invitedEditors: [], callLimit: 10
   };
   const { bonuses, equity, calls, huntType, callLimit, huntMode, roundRobin } = req.body;
@@ -495,7 +526,7 @@ app.put('/api/my-hunt', requireAuth, (req, res) => {
   if (equity     !== undefined) hunts[req.user.id].equity     = equity;
   if (calls      !== undefined) hunts[req.user.id].calls      = calls;
   if (huntType   !== undefined) {
-    if (huntType === 'vip' && !isAdmin(req.user) && !isVipHost(req.user))
+    if (huntType === 'vip' && !reqIsVipHost(req))
       return res.status(403).json({error:'Not authorised for VIP hunt'});
     hunts[req.user.id].huntType = huntType;
   }
@@ -504,7 +535,7 @@ app.put('/api/my-hunt', requireAuth, (req, res) => {
   if (roundRobin !== undefined) hunts[req.user.id].roundRobin = roundRobin;
   persistHunts();
   io.to(`hunt:${req.user.id}`).emit('hunt:update', hunts[req.user.id]);
-  emitHubUpdate();
+  emitHubUpdate(req.tenant.id);
   res.json({ok:true});
 });
 
@@ -586,25 +617,25 @@ app.put('/api/hunts/:userId', requireAuth, (req, res) => {
   if (roundRobin  !== undefined) hunt.roundRobin  = roundRobin;
   persistHunts();
   io.to(`hunt:${req.params.userId}`).emit('hunt:update', hunt);
-  emitHubUpdate();
+  emitHubUpdate(req.tenant.id);
   res.json({ok:true});
 });
 
 // ── Admin ──────────────────────────────────────────────────────────
-app.get('/api/admin/hunts', requireAdmin, (req, res) => res.json(getAllHunts()));
+app.get('/api/admin/hunts', requireAdmin, (req, res) => res.json(getAllHunts(req.tenant.id)));
 
 app.post('/api/admin/hunts/:userId/end', requireAdmin, (req, res) => {
   const h = hunts[req.params.userId];
   if (!h) return res.status(404).json({error:'Not found'});
   h.isLive = false; h.archivedAt = new Date().toISOString();
   archiveHunt(h);
-  emitHubUpdate(); io.to(`hunt:${req.params.userId}`).emit('hunt:update', h);
+  emitHubUpdate(req.tenant.id); io.to(`hunt:${req.params.userId}`).emit('hunt:update', h);
   res.json({ok:true});
 });
 
 app.delete('/api/admin/hunts/:userId', requireAdmin, (req, res) => {
   if (!hunts[req.params.userId]) return res.status(404).json({error:'Not found'});
-  delete hunts[req.params.userId]; emitHubUpdate();
+  delete hunts[req.params.userId]; emitHubUpdate(req.tenant.id);
   res.json({ok:true});
 });
 
@@ -616,7 +647,7 @@ app.delete('/api/admin/hunts/archived/:userId/:archivedAt', requireAdmin, (req, 
   if (idx === -1) return res.status(404).json({error:'Archived hunt not found'});
   archive.splice(idx, 1);
   persistArchive();
-  emitHubUpdate();
+  emitHubUpdate(req.tenant.id);
   res.json({ok:true});
 });
 
@@ -1024,17 +1055,40 @@ app.post('/api/tickets', async (req, res) => {
 // ── External integrations (Twitch live, leaderboard, Discord) ──────
 // Logic lives in lib/integrations.js; route declarations stay here and delegate.
 const integrations = require('./lib/integrations');
-integrations.startTwitchPolling(io);
+// Poll each active tenant's Twitch channel. Runs after tenants load.
+function startPolling() { integrations.startTenantPolling(io, tenants.getAllTenants()); }
+// initTenants() is async; give it a beat, then start polling (Bean is in cache immediately anyway).
+setTimeout(startPolling, 3000);
 
-app.get('/api/bean-live', (req, res) => res.json(integrations.getBeanLive()));
+app.get('/api/bean-live', (req, res) => res.json(integrations.getLiveStatus(req.tenant.slug)));
+
+// Active tenant's public branding — NO secrets (bot tokens, channel ids excluded).
+app.get('/api/tenant-config', (req, res) => {
+  const t = req.tenant;
+  res.json({
+    slug: t.slug, displayName: t.displayName,
+    branding: t.branding || {},
+    leaderboardUrl: !!t.leaderboardUrl,   // boolean: does a leaderboard exist?
+    twitchChannel: t.twitchChannel || null,
+  });
+});
+
+// Directory for the platform home — minimal public fields per tenant.
+app.get('/api/tenants', (req, res) => {
+  res.json(tenants.getAllTenants().filter(t => t.isActive).map(t => ({
+    slug: t.slug, displayName: t.displayName,
+    accent: (t.branding || {}).accent || null,
+    twitchChannel: t.twitchChannel || null,
+  })));
+});
 
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    res.json(await integrations.getLeaderboard());
+    res.json(await integrations.getLeaderboard(req.tenant));
   } catch (e) {
     console.error('[leaderboard] proxy error:', e.message);
     // Serve stale cache if we have it, so a transient upstream blip doesn't blank the panel.
-    const stale = integrations.getLeaderboardCache();
+    const stale = integrations.getLeaderboardCache(req.tenant.slug);
     if (stale) return res.json(stale);
     res.status(502).json({ error: 'leaderboard unavailable' });
   }
@@ -1045,7 +1099,7 @@ app.get('/api/discord/import-calls', requireAuth, async (req, res) => {
   try {
     const hunt = hunts[req.user.id];
     if (!hunt) return res.status(404).json({ error: 'No active hunt' });
-    res.json(await integrations.importCalls(hunt, normalizeSlot));
+    res.json(await integrations.importCalls(hunt, normalizeSlot, req.tenant));
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -1054,7 +1108,7 @@ app.get('/api/discord/import-calls', requireAuth, async (req, res) => {
 // Parse VIP winners from Discord — finds latest results message and extracts names.
 app.get('/api/discord/parse-winners', requireAuth, async (req, res) => {
   try {
-    res.json(await integrations.parseWinners());
+    res.json(await integrations.parseWinners(req.tenant));
   } catch(e) {
     res.status(500).json({ error: e.message });
   }
@@ -1357,7 +1411,7 @@ app.post('/api/hunts/:userId/request-calls', requireAuth, (req, res) => {
 
 // Get pending requests (hunt owner only)
 app.get('/api/hunts/:userId/call-requests', requireAuth, (req, res) => {
-  if (req.user.id !== req.params.userId && !isAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
+  if (req.user.id !== req.params.userId && !reqIsAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
   res.json(huntCallRequests[req.params.userId] || []);
 });
 
@@ -1365,7 +1419,7 @@ app.get('/api/hunts/:userId/call-requests', requireAuth, (req, res) => {
 app.post('/api/hunts/:userId/call-requests/:requestId', requireAuth, (req, res) => {
   const { userId, requestId } = req.params;
   const { action } = req.body; // 'grant' or 'deny'
-  if (req.user.id !== userId && !isAdmin(req.user)) return res.status(403).json({ error: 'Forbidden' });
+  if (req.user.id !== userId && !reqIsAdmin(req)) return res.status(403).json({ error: 'Forbidden' });
 
   const requests = huntCallRequests[userId] || [];
   const reqItem = requests.find(r => r.id === requestId);
@@ -1396,10 +1450,13 @@ app.post('/api/hunts/:userId/call-requests/:requestId', requireAuth, (req, res) 
 const socketUsers = {};
 
 io.on('connection', socket => {
+  // Tenant slug from the handshake query (?_tenant=); defaults to bean for back-compat.
+  const slug = socket.handshake.query._tenant || 'bean';
+
   socket.on('watch:hub', () => {
-    socket.join('hub');
-    socket.emit('hub:update', getPublicHunts());
-    socket.emit('bean:live', integrations.getBeanLive());
+    socket.join('hub:' + slug);
+    socket.emit('hub:update', getPublicHunts(slug));
+    socket.emit('bean:live', integrations.getLiveStatus(slug));
   });
 
   socket.on('watch:hunt', userId => {
@@ -1408,18 +1465,18 @@ io.on('connection', socket => {
     viewers[userId] = (viewers[userId]||0) + 1;
     const h = hunts[userId];
     if (h) socket.emit('hunt:update', h);
-    emitHubUpdate();
+    emitHubUpdate(tenantOf(h || {}));
     socket.on('disconnect', () => {
       viewers[userId] = Math.max(0,(viewers[userId]||1)-1);
       delete socketUsers[socket.id];
-      emitHubUpdate();
+      emitHubUpdate(tenantOf(hunts[userId] || {}));
     });
   });
 
   socket.on('leave:hunt', userId => {
     socket.leave(`hunt:${userId}`);
     if (viewers[userId]) viewers[userId] = Math.max(0, viewers[userId] - 1);
-    emitHubUpdate();
+    emitHubUpdate(tenantOf(hunts[userId] || {}));
   });
 
   // Client sends their user id so we can compute canEdit for them
