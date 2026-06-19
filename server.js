@@ -399,6 +399,10 @@ function reqIsAdmin(req) {
 }
 function reqIsVipHost(req) { return MULTI_TENANT ? tenants.isTenantVip(req.user, req.tenant)   : (isAdmin(req.user)||isVipHost(req.user)); }
 function requireAdmin(req, res, next) { if (!req.user||!reqIsAdmin(req)) return res.status(403).json({error:'Admin only'}); next(); }
+function requirePlatformAdmin(req, res, next) {
+  if (!req.user || !isPlatformAdmin(req.user)) return res.status(403).json({error:'Platform admin only'});
+  next();
+}
 
 // ── Mod hunt access ───────────────────────────────────────────────
 const MOD_HUNT_ID = '__mod_hunt__';
@@ -863,6 +867,55 @@ app.put('/api/hunts/:userId', requireAuth, (req, res) => {
 
 // ── Admin ──────────────────────────────────────────────────────────
 app.get('/api/admin/hunts', requireAdmin, (req, res) => res.json(getAllHunts(req.tenant.id)));
+
+// ── Platform-admin management ──────────────────────────────────────
+// List all platform admins with their source (owner | env | db) for the UI.
+app.get('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async (req, res) => {
+  const OWNER = tenants.PLATFORM_OWNER_ID;
+  const rows = []; // { discordId, source }
+  rows.push({ discordId: OWNER, source: 'owner' });
+  for (const id of ADMIN_IDS) if (id !== OWNER) rows.push({ discordId: id, source: 'env' });
+  const dbAdmins = await admins.listDbAdmins();
+  for (const a of dbAdmins) {
+    if (a.discordId === OWNER || ADMIN_IDS.includes(a.discordId)) continue; // dedup; owner/env win
+    rows.push({ discordId: a.discordId, source: 'db', addedBy: a.addedBy, addedAt: a.addedAt });
+  }
+  // Enrich with display name + avatar from known_users (best-effort).
+  let enriched = rows;
+  if (pgPool && rows.length) {
+    try {
+      const ids = rows.map(r => r.discordId);
+      const r = await pgPool.query(
+        `SELECT user_id, display_name, avatar FROM known_users WHERE user_id = ANY($1)`, [ids]);
+      const byId = {};
+      for (const u of r.rows) byId[u.user_id] = u;
+      enriched = rows.map(row => ({
+        ...row,
+        displayName: byId[row.discordId]?.display_name || null,
+        avatar: byId[row.discordId]?.avatar || null,
+      }));
+    } catch (e) { console.error('[admin] platform-admins enrich failed:', e.message); }
+  }
+  res.json(enriched);
+});
+
+// Add a DB platform admin. Owner/env entries are not addable here (they already are admins).
+app.post('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async (req, res) => {
+  const discordId = String(req.body?.discordId || '').trim();
+  if (!/^\d{5,}$/.test(discordId)) return res.status(400).json({error:'Valid Discord ID required'});
+  if (discordId === tenants.PLATFORM_OWNER_ID) return res.status(400).json({error:'Owner is always admin'});
+  await admins.addDbAdmin(discordId, req.user.id);
+  res.json({ ok: true });
+});
+
+// Remove a DB platform admin. Owner and env-var admins cannot be removed here.
+app.delete('/api/admin/platform-admins/:id', requireAuth, requirePlatformAdmin, async (req, res) => {
+  const id = String(req.params.id || '').trim();
+  if (id === tenants.PLATFORM_OWNER_ID) return res.status(400).json({error:'Owner cannot be removed'});
+  if (ADMIN_IDS.includes(id)) return res.status(400).json({error:'Env admin — managed via Railway ADMIN_IDS'});
+  await admins.removeDbAdmin(id);
+  res.json({ ok: true });
+});
 
 // ── Stale-hunt janitor ─────────────────────────────────────────────
 // Reap abandoned hunts after 36h of inactivity so the directory stays honest and storage bounded.
