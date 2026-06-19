@@ -44,9 +44,16 @@ function nameOf(user) { return (user?.displayName || user?.username || '').toLow
 // Normalize slot name for dedup: strip punctuation, collapse whitespace, lowercase
 function normalizeSlot(name) { return (name || '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim(); }
 function isAdmin(user) {
-  // ID-based only — display names are spoofable. Real admins live in ADMIN_IDS.
-  return !!(user && user.id && ADMIN_IDS.includes(user.id));
+  // ID-based only — display names are spoofable. Admins live in ADMIN_IDS (env),
+  // the platform_admins DB table, or are the hardcoded platform owner.
+  if (!user || !user.id) return false;
+  return ADMIN_IDS.includes(user.id)
+      || user.id === tenants.PLATFORM_OWNER_ID
+      || admins.isDbAdmin(user.id);
 }
+// Platform admin = admin on ALL tenants (owner + env + DB). Distinct from a
+// per-tenant community admin (tenant_roles). Used by admin-management endpoints.
+function isPlatformAdmin(user) { return isAdmin(user); }
 function isVipHost(user) {
   // ID-based only (see isAdmin). VIP hosts — and admins, who are also listed — in VIP_IDS.
   return !!(user && user.id && VIP_IDS.includes(user.id));
@@ -325,6 +332,8 @@ persistence.initPersistence({ pgPool, normalizeSlot })
 const tenants = require('./lib/tenants');
 const MULTI_TENANT = process.env.MULTI_TENANT === 'true';
 tenants.initTenants({ pgPool }).catch(e => console.error('[tenants] init error:', e.message));
+const admins = require('./lib/admins');
+admins.initAdmins({ pgPool }).catch(e => console.error('[admins] init error:', e.message));
 
 // Community memberships (which communities a user belongs to). One-time backfill attributes
 // every previously-known user to Bean; new users auto-join the slug they sign in through.
@@ -384,7 +393,10 @@ function emitHuntUpdate(userId) { const h = hunts[userId]; if (h) { persistHunts
 
 function requireAuth(req, res, next)  { if (!req.user) return res.status(401).json({error:'Not authenticated'}); next(); }
 // Tenant-aware gates: when MULTI_TENANT is on, resolve against req.tenant; else the env-based globals.
-function reqIsAdmin(req)   { return MULTI_TENANT ? tenants.isTenantAdmin(req.user, req.tenant) : isAdmin(req.user); }
+function reqIsAdmin(req) {
+  if (isPlatformAdmin(req.user)) return true;               // owner + env + DB → admin everywhere
+  return MULTI_TENANT ? tenants.isTenantAdmin(req.user, req.tenant) : false;
+}
 function reqIsVipHost(req) { return MULTI_TENANT ? tenants.isTenantVip(req.user, req.tenant)   : (isAdmin(req.user)||isVipHost(req.user)); }
 function requireAdmin(req, res, next) { if (!req.user||!reqIsAdmin(req)) return res.status(403).json({error:'Admin only'}); next(); }
 
