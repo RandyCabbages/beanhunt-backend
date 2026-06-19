@@ -622,33 +622,28 @@ app.delete('/api/my-hunt/invite', requireAuth, (req, res) => {
   res.json({ok:true, invitedEditors: hunts[req.user.id].invitedEditors});
 });
 
-// ── Equity member: add slot call ────────────────────────────────────
-app.post('/api/hunts/:userId/calls', requireAuth, (req, res) => {
-  const hunt = hunts[req.params.userId];
-  if (!hunt) return res.status(404).json({error:'Hunt not found'});
-  if (!canEditHunt(req.user, req.params.userId) && !isEquityMember(req.user, req.params.userId))
-    return res.status(403).json({error:'Not an equity member'});
+// Shared add-call logic for both the equity-member endpoint and the public link endpoint.
+// `isEditor` controls the rolling-mode + callLimit exemptions (owners/admins bypass them).
+function addCallToHunt(hunt, user, slot, isEditor) {
+  if (!slot?.trim()) return { error: 'Slot name required', status: 400 };
 
-  const { slot } = req.body;
-  if (!slot?.trim()) return res.status(400).json({error:'Slot name required'});
-
-  // Block equity members (non-editors) from adding calls when rolling
-  if (hunt.huntMode === 'rolling' && !canEditHunt(req.user, req.params.userId))
-    return res.status(403).json({error:'Cannot add calls while the hunt is rolling'});
+  // Block non-editors from adding calls when the hunt is rolling
+  if (hunt.huntMode === 'rolling' && !isEditor)
+    return { error: 'Cannot add calls while the hunt is rolling', status: 403 };
 
   // Duplicate check (normalized: "CULT" === "CULT.")
   if (hunt.calls.some(c => normalizeSlot(c.slot) === normalizeSlot(slot)))
-    return res.status(400).json({error:`"${slot}" is already in the queue`});
+    return { error: `"${slot}" is already in the queue`, status: 400 };
 
-  // Per-person limit (not applied to hunt owner or admins)
-  const callerName = nameOf(req.user);
-  if (hunt.callLimit > 0 && !canEditHunt(req.user, req.params.userId)) {
+  // Per-person limit (not applied to editors/admins)
+  const callerName = nameOf(user);
+  if (hunt.callLimit > 0 && !isEditor) {
     const myCount = hunt.calls.filter(c => c.user.toLowerCase() === callerName).length;
     if (myCount >= hunt.callLimit)
-      return res.status(400).json({error:`You've reached the limit of ${hunt.callLimit} calls`});
+      return { error: `You've reached the limit of ${hunt.callLimit} calls`, status: 400 };
   }
 
-  const newCall = { id: Math.random().toString(36).slice(2,8), slot: slot.trim(), user: req.user.displayName||req.user.username, status: 'pending' };
+  const newCall = { id: Math.random().toString(36).slice(2,8), slot: slot.trim(), user: user.displayName||user.username, status: 'pending' };
   // Insert after first 3 pending calls so top 3 stay stable
   const pendingCalls = hunt.calls.filter(c=>c.status==='pending');
   const otherCalls   = hunt.calls.filter(c=>c.status!=='pending');
@@ -656,8 +651,36 @@ app.post('/api/hunts/:userId/calls', requireAuth, (req, res) => {
   pendingCalls.splice(insertAt, 0, newCall);
   hunt.calls = [...pendingCalls, ...otherCalls];
   persistHunts();
-  io.to(`hunt:${req.params.userId}`).emit('hunt:update', hunt);
-  res.json({ok:true, call: newCall});
+  io.to(`hunt:${hunt.user.id}`).emit('hunt:update', hunt);
+  return { ok: true, call: newCall };
+}
+
+// ── Equity member: add slot call ────────────────────────────────────
+app.post('/api/hunts/:userId/calls', requireAuth, (req, res) => {
+  const hunt = hunts[req.params.userId];
+  if (!hunt) return res.status(404).json({error:'Hunt not found'});
+  if (!canEditHunt(req.user, req.params.userId) && !isEquityMember(req.user, req.params.userId))
+    return res.status(403).json({error:'Not an equity member'});
+
+  const isEditor = canEditHunt(req.user, req.params.userId);
+  const result = addCallToHunt(hunt, req.user, req.body.slot, isEditor);
+  if (result.error) return res.status(result.status).json({error: result.error});
+  res.json({ok:true, call: result.call});
+});
+
+// ── Public link: add slot call (any logged-in user, optional PIN, no equity membership) ──
+app.post('/api/hunts/:userId/public-calls', requireAuth, (req, res) => {
+  const hunt = hunts[req.params.userId];
+  if (!hunt) return res.status(404).json({error:'Hunt not found'});
+  if (!hunt.publicCalls) return res.status(403).json({error:'Call link is disabled'});
+  if (hunt.publicCallsPin && req.body.pin !== hunt.publicCallsPin)
+    return res.status(403).json({error:'Incorrect PIN'});
+
+  // Owners/admins/editors keep their exemptions; everyone else is a limited submitter.
+  const isEditor = canEditHunt(req.user, req.params.userId);
+  const result = addCallToHunt(hunt, req.user, req.body.slot, isEditor);
+  if (result.error) return res.status(result.status).json({error: result.error});
+  res.json({ok:true, call: result.call});
 });
 
 // ── Edit any hunt (admin/editor) ───────────────────────────────────
