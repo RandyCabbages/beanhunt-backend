@@ -360,14 +360,14 @@ function huntCompleted(h) {
 }
 function tenantOf(h) { return h.tenantId || 'bean'; } // untagged hunts belong to Bean (back-compat)
 function inTenant(h, tenantId) { return tenantOf(h) === (tenantId || 'bean'); }
-function getPublicHunts(tenantId)   { return Object.values(hunts).filter(h=>h.isLive && inTenant(h,tenantId)).map(huntSummary); }
+function getPublicHunts(tenantId)   { return Object.values(hunts).filter(h=>h.isLive && inTenant(h,tenantId) && h.user?.id !== MOD_HUNT_ID).map(huntSummary); }
 // Public Archived tab: only completed hunts (every bonus opened). Incomplete ended hunts are
 // hidden here — admins still see them in the All tab, and the janitor eventually reaps them.
 function getArchivedHunts(tenantId) { return archive.filter(h=>inTenant(h,tenantId) && huntCompleted(h)).map(huntSummary); }
 // Admin All tab: every hunt — created, live, and archived. Union of the current hunts (created/
 // live/ended) with archived snapshots whose hunt is no longer current, deduped by huntId.
 function getAllHunts(tenantId) {
-  const current = Object.values(hunts).filter(h=>inTenant(h,tenantId));
+  const current = Object.values(hunts).filter(h=>inTenant(h,tenantId) && h.user?.id !== MOD_HUNT_ID);
   const seen = new Set(current.map(h=>h.huntId).filter(Boolean));
   const archivedOnly = archive.filter(h=>inTenant(h,tenantId) && (!h.huntId || !seen.has(h.huntId)));
   return [...current, ...archivedOnly].map(huntSummary);
@@ -387,6 +387,26 @@ function requireAuth(req, res, next)  { if (!req.user) return res.status(401).js
 function reqIsAdmin(req)   { return MULTI_TENANT ? tenants.isTenantAdmin(req.user, req.tenant) : isAdmin(req.user); }
 function reqIsVipHost(req) { return MULTI_TENANT ? tenants.isTenantVip(req.user, req.tenant)   : (isAdmin(req.user)||isVipHost(req.user)); }
 function requireAdmin(req, res, next) { if (!req.user||!reqIsAdmin(req)) return res.status(403).json({error:'Admin only'}); next(); }
+
+// ── Mod hunt access ───────────────────────────────────────────────
+const MOD_HUNT_ID = '__mod_hunt__';
+const MOD_HUNT_ALLOWED_IDS = new Set([
+  '135203806676779008',   // Bean
+  '158594379773247489',   // Missingiscool
+  '197365493516992512',   // mihailimou
+  '102963341407838208',   // Mcflury
+]);
+function canAccessModHunt(req) {
+  if (!req.user) return false;
+  if (reqIsAdmin(req)) return true;
+  return MOD_HUNT_ALLOWED_IDS.has(req.user.id);
+}
+function requireModHuntAccess(req, res, next) {
+  if (!req.user) return res.status(401).json({ error: 'Not authenticated' });
+  if (!canAccessModHunt(req)) return res.status(403).json({ error: 'Access denied' });
+  next();
+}
+
 function uid() { return Math.random().toString(36).slice(2, 8); }
 // Stamp a hunt's last-activity time so the stale-hunt janitor (cleanupStaleHunts) can measure idleness.
 function touch(userId) { const h = hunts[userId]; if (h) h.updatedAt = new Date().toISOString(); }
@@ -660,6 +680,86 @@ app.delete('/api/my-hunt/invite', requireAuth, (req, res) => {
   persistHunts();
   io.to(`hunt:${req.user.id}`).emit('hunt:reinvite', { huntUserId: req.user.id });
   res.json({ok:true, invitedEditors: hunts[req.user.id].invitedEditors});
+});
+
+// ── Mod hunt — private solo hunt for Bean, managed by mods ────────
+// Stored under the fixed key MOD_HUNT_ID so the OBS overlay link never changes.
+// Never appears on Hub or archive listings.
+function emptyModHunt(tenantId) {
+  return {
+    user: { id: MOD_HUNT_ID, displayName: 'Bean', avatar: null },
+    huntId: uid(), isLive: false, startedAt: null, archivedAt: null,
+    tenantId: tenantId || 'bean',
+    createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+    huntType: 'solo', bonuses: [], equity: [{ id: 'bean_auto', name: 'Bean', amount: 0, isRollWinner: false }],
+    calls: [], invitedEditors: [], callLimit: 0, huntMode: 'creating',
+    roundRobin: false, currency: 'USD', publicCalls: false, publicCallsPin: null,
+  };
+}
+
+app.get('/api/mod-hunt', requireModHuntAccess, (req, res) => {
+  res.json(hunts[MOD_HUNT_ID] || null);
+});
+
+app.put('/api/mod-hunt', requireModHuntAccess, (req, res) => {
+  if (rejectBadHuntInput(req, res)) return;
+  if (!hunts[MOD_HUNT_ID]) hunts[MOD_HUNT_ID] = emptyModHunt(req.tenant.id);
+  const { bonuses, equity, calls, callLimit, huntMode, roundRobin, currency, currentSlot } = req.body;
+  if (bonuses    !== undefined) hunts[MOD_HUNT_ID].bonuses    = bonuses;
+  if (equity     !== undefined) hunts[MOD_HUNT_ID].equity     = equity;
+  if (calls      !== undefined) hunts[MOD_HUNT_ID].calls      = calls;
+  if (callLimit  !== undefined) hunts[MOD_HUNT_ID].callLimit  = callLimit;
+  if (huntMode   !== undefined) hunts[MOD_HUNT_ID].huntMode   = huntMode;
+  if (roundRobin !== undefined) hunts[MOD_HUNT_ID].roundRobin = roundRobin;
+  if (currency   !== undefined) hunts[MOD_HUNT_ID].currency   = currency;
+  if (currentSlot !== undefined) hunts[MOD_HUNT_ID].currentSlot = currentSlot;
+  hunts[MOD_HUNT_ID].huntType = 'solo';
+  touch(MOD_HUNT_ID);
+  persistHunts();
+  io.to(`hunt:${MOD_HUNT_ID}`).emit('hunt:update', publicHuntView(hunts[MOD_HUNT_ID]));
+  res.json({ ok: true });
+});
+
+app.post('/api/mod-hunt/golive', requireModHuntAccess, (req, res) => {
+  if (!hunts[MOD_HUNT_ID]) hunts[MOD_HUNT_ID] = emptyModHunt(req.tenant.id);
+  hunts[MOD_HUNT_ID].isLive     = true;
+  hunts[MOD_HUNT_ID].startedAt  = new Date().toISOString();
+  hunts[MOD_HUNT_ID].updatedAt  = new Date().toISOString();
+  hunts[MOD_HUNT_ID].archivedAt = null;
+  persistHunts();
+  io.to(`hunt:${MOD_HUNT_ID}`).emit('hunt:update', publicHuntView(hunts[MOD_HUNT_ID]));
+  res.json({ ok: true });
+});
+
+app.post('/api/mod-hunt/end', requireModHuntAccess, (req, res) => {
+  const h = hunts[MOD_HUNT_ID];
+  if (h) {
+    h.isLive = false;
+    h.updatedAt = new Date().toISOString();
+    if (!h.archivedAt) h.archivedAt = new Date().toISOString();
+    persistHunts();
+    io.to(`hunt:${MOD_HUNT_ID}`).emit('hunt:update', publicHuntView(h));
+  }
+  res.json({ ok: true });
+});
+
+app.post('/api/mod-hunt/reopen', requireModHuntAccess, (req, res) => {
+  const h = hunts[MOD_HUNT_ID];
+  if (!h) return res.status(404).json({ error: 'No mod hunt' });
+  h.isLive = true;
+  h.updatedAt = new Date().toISOString();
+  h.archivedAt = null;
+  if (!h.startedAt) h.startedAt = new Date().toISOString();
+  persistHunts();
+  io.to(`hunt:${MOD_HUNT_ID}`).emit('hunt:update', publicHuntView(h));
+  res.json({ ok: true });
+});
+
+app.post('/api/mod-hunt/reset', requireModHuntAccess, (req, res) => {
+  hunts[MOD_HUNT_ID] = emptyModHunt(req.tenant.id);
+  persistHunts();
+  io.to(`hunt:${MOD_HUNT_ID}`).emit('hunt:update', publicHuntView(hunts[MOD_HUNT_ID]));
+  res.json({ ok: true });
 });
 
 // Shared add-call logic for both the equity-member endpoint and the public link endpoint.
