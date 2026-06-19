@@ -903,13 +903,13 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, async (req, res) => {
 // List all platform admins with their source (owner | env | db) for the UI.
 app.get('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async (req, res) => {
   try {
-    const OWNER = tenants.PLATFORM_OWNER_ID;
+    const OWNERS = tenants.PLATFORM_OWNER_IDS;
     const rows = []; // { discordId, source }
-    rows.push({ discordId: OWNER, source: 'owner' });
-    for (const id of ADMIN_IDS) if (id !== OWNER) rows.push({ discordId: id, source: 'env' });
+    for (const id of OWNERS) rows.push({ discordId: id, source: 'owner' });
+    for (const id of ADMIN_IDS) if (!OWNERS.includes(id)) rows.push({ discordId: id, source: 'env' });
     const dbAdmins = await admins.listDbAdmins();
     for (const a of dbAdmins) {
-      if (a.discordId === OWNER || ADMIN_IDS.includes(a.discordId)) continue; // dedup; owner/env win
+      if (OWNERS.includes(a.discordId) || ADMIN_IDS.includes(a.discordId)) continue; // dedup; owner/env win
       rows.push({ discordId: a.discordId, source: 'db', addedBy: a.addedBy, addedAt: a.addedAt });
     }
     // Enrich with display name + avatar from known_users (best-effort).
@@ -939,7 +939,7 @@ app.get('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async (
 app.post('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async (req, res) => {
   const discordId = String(req.body?.discordId || '').trim();
   if (!/^\d{5,}$/.test(discordId)) return res.status(400).json({error:'Valid Discord ID required'});
-  if (discordId === tenants.PLATFORM_OWNER_ID) return res.status(400).json({error:'Owner is always admin'});
+  if (tenants.isPlatformOwnerId(discordId)) return res.status(400).json({error:'Owner is always admin'});
   try {
     await admins.addDbAdmin(discordId, req.user.id);
     res.json({ ok: true });
@@ -952,7 +952,7 @@ app.post('/api/admin/platform-admins', requireAuth, requirePlatformAdmin, async 
 // Remove a DB platform admin. Owner and env-var admins cannot be removed here.
 app.delete('/api/admin/platform-admins/:id', requireAuth, requirePlatformAdmin, async (req, res) => {
   const id = String(req.params.id || '').trim();
-  if (id === tenants.PLATFORM_OWNER_ID) return res.status(400).json({error:'Owner cannot be removed'});
+  if (tenants.isPlatformOwnerId(id)) return res.status(400).json({error:'Owner cannot be removed'});
   if (ADMIN_IDS.includes(id)) return res.status(400).json({error:'Env admin — managed via Railway ADMIN_IDS'});
   try {
     await admins.removeDbAdmin(id);
