@@ -1,0 +1,74 @@
+// External-integration routes. Logic lives in lib/integrations.js; these are thin
+// delegations. Mounted from the server.js composition root.
+//
+//   GET /api/bean-live             → active tenant's Twitch live status
+//   GET /api/tenant-config         → PUBLIC branding (no secrets) — field names are contract
+//   GET /api/tenants               → PUBLIC directory for the platform home — field names are contract
+//   GET /api/leaderboard           → per-tenant leaderboard proxy (serves stale cache on upstream blip)
+//   GET /api/discord/import-calls  → import slot calls from Discord (auth; user's active hunt)
+//   GET /api/discord/parse-winners → parse VIP winners from Discord (auth)
+
+const express = require('express');
+
+module.exports = function integrationsRoutes(deps) {
+  const { integrations, tenants, memberships, hunts, normalizeSlot, requireAuth } = deps;
+  const router = express.Router();
+
+  router.get('/api/bean-live', (req, res) => res.json(integrations.getLiveStatus(req.tenant.slug)));
+
+  // Active tenant's public branding — NO secrets (bot tokens, channel ids excluded).
+  router.get('/api/tenant-config', (req, res) => {
+    const t = req.tenant;
+    res.json({
+      slug: t.slug, displayName: t.displayName,
+      branding: t.branding || {},
+      leaderboardUrl: !!t.leaderboardUrl,   // boolean: does a leaderboard exist?
+      twitchChannel: t.twitchChannel || null,
+    });
+  });
+
+  // Directory for the platform home — minimal public fields per tenant, incl. member count.
+  router.get('/api/tenants', async (req, res) => {
+    const counts = await memberships.getMemberCounts();
+    res.json(tenants.getAllTenants().filter(t => t.isActive).map(t => ({
+      slug: t.slug, displayName: t.displayName,
+      accent: (t.branding || {}).accent || null,
+      twitchChannel: t.twitchChannel || null,
+      memberCount: counts[t.id] || 0,
+    })));
+  });
+
+  router.get('/api/leaderboard', async (req, res) => {
+    try {
+      res.json(await integrations.getLeaderboard(req.tenant));
+    } catch (e) {
+      console.error('[leaderboard] proxy error:', e.message);
+      // Serve stale cache if we have it, so a transient upstream blip doesn't blank the panel.
+      const stale = integrations.getLeaderboardCache(req.tenant.slug);
+      if (stale) return res.json(stale);
+      res.status(502).json({ error: 'leaderboard unavailable' });
+    }
+  });
+
+  // Import slot calls from last 20 mins — only from equity members of the user's hunt.
+  router.get('/api/discord/import-calls', requireAuth, async (req, res) => {
+    try {
+      const hunt = hunts[req.user.id];
+      if (!hunt) return res.status(404).json({ error: 'No active hunt' });
+      res.json(await integrations.importCalls(hunt, normalizeSlot, req.tenant));
+    } catch(e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // Parse VIP winners from Discord — finds latest results message and extracts names.
+  router.get('/api/discord/parse-winners', requireAuth, async (req, res) => {
+    try {
+      res.json(await integrations.parseWinners(req.tenant));
+    } catch(e) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  return router;
+};

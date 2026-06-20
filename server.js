@@ -1181,68 +1181,16 @@ app.delete('/api/admin/hunts/archived/:userId/:archivedAt', requireAdmin, (req, 
 // /api/tickets moved to routes/misc.routes.js (mounted below near the slots router).
 
 // ── External integrations (Twitch live, leaderboard, Discord) ──────
-// Logic lives in lib/integrations.js; route declarations stay here and delegate.
+// Logic lives in lib/integrations.js; routes in routes/integrations.routes.js.
 const integrations = require('./lib/integrations');
 // Poll each active tenant's Twitch channel. Runs after tenants load.
 function startPolling() { integrations.startTenantPolling(io, tenants.getAllTenants()); }
 // initTenants() is async; give it a beat, then start polling (Bean is in cache immediately anyway).
 setTimeout(startPolling, 3000);
 
-app.get('/api/bean-live', (req, res) => res.json(integrations.getLiveStatus(req.tenant.slug)));
-
-// Active tenant's public branding — NO secrets (bot tokens, channel ids excluded).
-app.get('/api/tenant-config', (req, res) => {
-  const t = req.tenant;
-  res.json({
-    slug: t.slug, displayName: t.displayName,
-    branding: t.branding || {},
-    leaderboardUrl: !!t.leaderboardUrl,   // boolean: does a leaderboard exist?
-    twitchChannel: t.twitchChannel || null,
-  });
-});
-
-// Directory for the platform home — minimal public fields per tenant, incl. member count.
-app.get('/api/tenants', async (req, res) => {
-  const counts = await memberships.getMemberCounts();
-  res.json(tenants.getAllTenants().filter(t => t.isActive).map(t => ({
-    slug: t.slug, displayName: t.displayName,
-    accent: (t.branding || {}).accent || null,
-    twitchChannel: t.twitchChannel || null,
-    memberCount: counts[t.id] || 0,
-  })));
-});
-
-app.get('/api/leaderboard', async (req, res) => {
-  try {
-    res.json(await integrations.getLeaderboard(req.tenant));
-  } catch (e) {
-    console.error('[leaderboard] proxy error:', e.message);
-    // Serve stale cache if we have it, so a transient upstream blip doesn't blank the panel.
-    const stale = integrations.getLeaderboardCache(req.tenant.slug);
-    if (stale) return res.json(stale);
-    res.status(502).json({ error: 'leaderboard unavailable' });
-  }
-});
-
-// Import slot calls from last 20 mins — only from equity members of the user's hunt.
-app.get('/api/discord/import-calls', requireAuth, async (req, res) => {
-  try {
-    const hunt = hunts[req.user.id];
-    if (!hunt) return res.status(404).json({ error: 'No active hunt' });
-    res.json(await integrations.importCalls(hunt, normalizeSlot, req.tenant));
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Parse VIP winners from Discord — finds latest results message and extracts names.
-app.get('/api/discord/parse-winners', requireAuth, async (req, res) => {
-  try {
-    res.json(await integrations.parseWinners(req.tenant));
-  } catch(e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+app.use(require('./routes/integrations.routes')({
+  integrations, tenants, memberships, hunts, normalizeSlot, requireAuth,
+}));
 
 
 // ── Slot Autocomplete + image proxy ───────────────────────────────
