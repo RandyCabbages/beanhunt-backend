@@ -24,6 +24,12 @@ const ALLOWED_ORIGINS = [
 ];
 function corsOrigin(origin, callback) {
   if (!origin || ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+  // Browser-extension requests (the CommunityHunts Chrome extension) send
+  // Origin: chrome-extension://<id>. Allow the scheme — the extension's mutating
+  // calls are authenticated by HMAC Bearer token, not by origin/cookies, and the
+  // id is unstable for unpacked installs so we can't hardcode it. GET polls send
+  // no Origin (allowed above); only PUT/POST saves send it, which is why saves 500'd.
+  if (/^chrome-extension:\/\//.test(origin) || /^moz-extension:\/\//.test(origin)) return callback(null, true);
   callback(new Error('Not allowed by CORS'));
 }
 
@@ -361,18 +367,14 @@ app.use(require('./routes/settings.routes')({
 }));
 
 
-// TEMP DEBUG (remove after diagnosing the extension miss-save 500): a global error handler.
-// Without this, an uncaught throw in any route returns Express's default HTML "Internal Server
-// Error" and the stack is lost. This logs the full stack (Railway logs) AND returns it in the
-// JSON body so the extension console (which prints the 500 response) surfaces the real error.
+// Global error handler. Without one, an uncaught throw in any route returns Express's default
+// HTML "Internal Server Error" with the stack thrown away (which is what hid the extension CORS
+// 500). Log the full stack server-side (Railway logs) and return a generic JSON error — no stack
+// leak in the response body.
 app.use((err, req, res, next) => {
   console.error(`[ERR] ${req.method} ${req.originalUrl}\n`, err && err.stack ? err.stack : err);
   if (res.headersSent) return next(err);
-  res.status(500).json({
-    error: 'Internal Server Error',
-    message: String(err && err.message),
-    where: (err && err.stack ? err.stack : '').split('\n').slice(0, 8),
-  });
+  res.status(500).json({ error: 'Internal Server Error' });
 });
 
 // ── Socket.io ─────────────────────────────────────────────────────
