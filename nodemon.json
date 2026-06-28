@@ -1,0 +1,12 @@
+{
+  "watch": ["server.js", "routes", "lib"],
+  "ext": "js",
+  "ignore": [
+    "hunts_data.json",
+    "hunts_archive.json",
+    "share_tokens.json",
+    "*_slots.json",
+    "*_hits.json",
+    "node_modules"
+  ]
+}
