@@ -5,6 +5,7 @@
 // trigger via the injected cleanupStaleHunts.
 //
 //   GET    /api/admin/hunts                              — all hunts (admin)
+//   GET    /api/admin/gotin-log                          — every got-in {ts,slot,bet}, newest first (admin)
 //   GET    /api/admin/overview                           — dashboard counts (admin)
 //   GET    /api/admin/platform-admins                    — list platform admins (platform admin)
 //   POST   /api/admin/platform-admins                    — add a DB platform admin
@@ -20,7 +21,7 @@ const express = require('express');
 module.exports = function adminRoutes(deps) {
   const {
     requireAuth, requireAdmin, requirePlatformAdmin,
-    getAllHunts, getArchivedHunts,
+    getAllHunts, getArchivedHunts, getGotInLog,
     pgPool, admins, tenants, ADMIN_IDS,
     hunts, archive, archiveHunt, unarchiveHunt, persistArchive,
     emitHubUpdate, publicHuntView, io, uid, cleanupStaleHunts,
@@ -28,6 +29,12 @@ module.exports = function adminRoutes(deps) {
   const router = express.Router();
 
   router.get('/api/admin/hunts', requireAdmin, (req, res) => res.json(getAllHunts(req.tenant.id)));
+
+  // Got-In log — every slot that got in, with timestamp + bet, newest first (tenant-scoped).
+  // Backs the admin "Export Got-In Sheet" CSV download in the frontend Settings page.
+  router.get('/api/admin/gotin-log', requireAuth, requireAdmin, (req, res) => {
+    res.json({ rows: getGotInLog(req.tenant?.id || 'bean'), generatedAt: Date.now() });
+  });
 
   // Lightweight dashboard counts for the current tenant.
   router.get('/api/admin/overview', requireAuth, requireAdmin, async (req, res) => {
