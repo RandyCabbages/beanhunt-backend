@@ -32,7 +32,7 @@ module.exports = function modsRoutes(deps) {
           }));
         } catch (e) { console.error('[mods] enrich failed:', e.message); }
       }
-      res.json(rows);
+      res.json({ communityName: req.tenant?.displayName || 'Bean', mods: rows });
     } catch (e) {
       console.error('[mods] list failed:', e.message);
       res.status(500).json({ error: 'Failed to list mods' });
