@@ -51,7 +51,7 @@ module.exports = function modHuntRoutes(deps) {
     if (rejectBadHuntInput(req, res)) return;
     const key = modHuntKey(req.tenant.id);
     if (!hunts[key]) hunts[key] = emptyModHunt(req.tenant.id);
-    const { bonuses, equity, calls, callLimit, huntMode, roundRobin, lockTop4, currency, currentSlot } = req.body;
+    const { bonuses, equity, calls, callLimit, huntMode, roundRobin, lockTop4, currency, currentSlot, manualOrder } = req.body;
     if (bonuses    !== undefined) hunts[key].bonuses    = bonuses;
     if (equity     !== undefined) hunts[key].equity     = equity;
     if (calls      !== undefined) hunts[key].calls      = calls;
@@ -61,6 +61,7 @@ module.exports = function modHuntRoutes(deps) {
     if (lockTop4   !== undefined) hunts[key].lockTop4   = lockTop4;
     if (currency   !== undefined) hunts[key].currency   = currency;
     if (currentSlot !== undefined) hunts[key].currentSlot = currentSlot;
+    if (manualOrder !== undefined) hunts[key].manualOrder = manualOrder;
     hunts[key].huntType = 'solo';
     touch(key);
     persistHunts();
@@ -174,7 +175,7 @@ module.exports = function modHuntRoutes(deps) {
     if (rejectBadHuntInput(req, res)) return;
     const key = affiliateHuntKey(req.tenant.id);
     if (!hunts[key]) hunts[key] = emptyAffiliateHunt(req.tenant.id);
-    const { bonuses, equity, calls, callLimit, huntMode, roundRobin, lockTop4, currency, currentSlot } = req.body;
+    const { bonuses, equity, calls, callLimit, huntMode, roundRobin, lockTop4, currency, currentSlot, manualOrder } = req.body;
     if (bonuses    !== undefined) hunts[key].bonuses    = bonuses;
     if (equity     !== undefined) hunts[key].equity     = equity;
     if (calls      !== undefined) hunts[key].calls      = calls;
@@ -184,6 +185,7 @@ module.exports = function modHuntRoutes(deps) {
     if (lockTop4   !== undefined) hunts[key].lockTop4   = lockTop4;
     if (currency   !== undefined) hunts[key].currency   = currency;
     if (currentSlot !== undefined) hunts[key].currentSlot = currentSlot;
+    if (manualOrder !== undefined) hunts[key].manualOrder = manualOrder;
     hunts[key].huntType = 'vip';
     touch(key);
     persistHunts();
