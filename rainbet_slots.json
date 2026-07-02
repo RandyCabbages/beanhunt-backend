@@ -45568,5 +45568,20 @@
     "rainbetSlug": "nolimit-afk-airport-security",
     "name": "AFK Airport Security",
     "thumb": "https://cdn.softswiss.net/i/s4/nolimitcity/AfkAirportSecurity.webp"
+  },
+  {
+    "rainbetSlug": "pragmatic-play-luxor-of-cleopatra",
+    "name": "Luxor of Cleopatra",
+    "thumb": "https://cdn.softswiss.net/i/s4/pragmatic/LuxorOfCleopatra.webp"
+  },
+  {
+    "rainbetSlug": "gamomat-book-of-madness-deluxe",
+    "name": "Book Of Madness Deluxe",
+    "thumb": null
+  },
+  {
+    "rainbetSlug": "push-gaming-jiggys-pot-ogold",
+    "name": "Jiggy's Pot O'Gold",
+    "thumb": "https://cdn.softswiss.net/i/s4/pushgaming/JiggysPotOgold.webp"
   }
 ]
